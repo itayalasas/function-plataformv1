@@ -22,6 +22,7 @@ ENV HOST=0.0.0.0
 
 # TanStack Start emits dist/server/server.js plus client/server assets.
 COPY --from=builder /app/dist ./dist
+COPY --from=builder /app/node_modules ./node_modules
 COPY scripts/aca-node-server.mjs ./aca-node-server.mjs
 
 EXPOSE 8080
