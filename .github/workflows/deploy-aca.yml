@@ -46,26 +46,70 @@ jobs:
           docker push "${{ steps.meta.outputs.image }}"
           docker push "${ACR_NAME}.azurecr.io/${IMAGE_NAME}:latest"
 
-      - name: Create or update Container App
+      - name: Ensure Container App exists
         run: |
           set -e
           if az containerapp show -g "$AZURE_RESOURCE_GROUP" -n "$ACA_NAME" >/dev/null 2>&1; then
-            echo "Updating existing Container App $ACA_NAME..."
-            az containerapp update \
-              -g "$AZURE_RESOURCE_GROUP" -n "$ACA_NAME" \
-              --image "${{ steps.meta.outputs.image }}"
+            echo "Container App $ACA_NAME already exists."
           else
-            echo "Creating Container App $ACA_NAME..."
+            echo "Creating Container App shell $ACA_NAME..."
             az containerapp create \
               -g "$AZURE_RESOURCE_GROUP" -n "$ACA_NAME" \
               --environment "$ACA_ENVIRONMENT" \
-              --image "${{ steps.meta.outputs.image }}" \
+              --image "mcr.microsoft.com/k8se/quickstart:latest" \
               --target-port "$TARGET_PORT" \
               --ingress external \
-              --registry-server "${ACR_NAME}.azurecr.io" \
               --min-replicas 1 --max-replicas 3 \
               --cpu 0.5 --memory 1.0Gi
           fi
+
+      - name: Configure ACR access
+        run: |
+          set -e
+          ACR_SERVER="${ACR_NAME}.azurecr.io"
+          ACR_ID=$(az acr show -n "$ACR_NAME" --query id -o tsv)
+
+          echo "Ensuring Container App identity..."
+          az containerapp identity assign \
+            -g "$AZURE_RESOURCE_GROUP" -n "$ACA_NAME" \
+            --system-assigned >/dev/null
+
+          PRINCIPAL_ID=""
+          for _ in $(seq 1 12); do
+            PRINCIPAL_ID=$(az containerapp show -g "$AZURE_RESOURCE_GROUP" -n "$ACA_NAME" --query identity.principalId -o tsv)
+            if [ -n "$PRINCIPAL_ID" ]; then
+              break
+            fi
+            sleep 5
+          done
+          if [ -z "$PRINCIPAL_ID" ]; then
+            echo "Failed to resolve the Container App principal ID."
+            exit 1
+          fi
+
+          echo "Granting AcrPull to $PRINCIPAL_ID on $ACR_ID..."
+          az role assignment create \
+            --assignee-object-id "$PRINCIPAL_ID" \
+            --assignee-principal-type ServicePrincipal \
+            --role AcrPull \
+            --scope "$ACR_ID" \
+            --only-show-errors || true
+
+          echo "Waiting for RBAC propagation..."
+          sleep 20
+
+          echo "Configuring Container App registry access..."
+          az containerapp registry set \
+            -g "$AZURE_RESOURCE_GROUP" -n "$ACA_NAME" \
+            --server "$ACR_SERVER" \
+            --identity system
+
+      - name: Deploy private image
+        run: |
+          set -e
+          az containerapp update \
+            -g "$AZURE_RESOURCE_GROUP" -n "$ACA_NAME" \
+            --image "${{ steps.meta.outputs.image }}"
 
       - name: Show public URL
         run: |
