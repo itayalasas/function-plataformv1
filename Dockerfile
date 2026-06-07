@@ -1,26 +1,28 @@
 # --- Build stage ---
-FROM oven/bun:1.1-alpine AS builder
+# Use Microsoft-hosted base images so CI does not depend on Docker Hub.
+FROM mcr.microsoft.com/devcontainers/javascript-node:22 AS builder
 WORKDIR /app
 
 # Install deps (cacheable layer)
-COPY package.json bun.lock* ./
-RUN bun install --frozen-lockfile || bun install
+COPY package.json package-lock.json* ./
+RUN npm ci || npm install
 
 # Copy sources and build with Node server preset (Nitro)
 COPY . .
 ENV NITRO_PRESET=node-server
 ENV NODE_ENV=production
-RUN bun run build
+RUN npm run build
 
 # --- Runtime stage ---
-FROM node:20-alpine AS runner
+FROM mcr.microsoft.com/devcontainers/javascript-node:22 AS runner
 WORKDIR /app
 ENV NODE_ENV=production
 ENV PORT=8080
 ENV HOST=0.0.0.0
 
-# Nitro node-server output lands in .output/
-COPY --from=builder /app/.output ./.output
+# TanStack Start emits dist/server/server.js plus client/server assets.
+COPY --from=builder /app/dist ./dist
+COPY scripts/aca-node-server.mjs ./aca-node-server.mjs
 
 EXPOSE 8080
-CMD ["node", ".output/server/index.mjs"]
+CMD ["node", "aca-node-server.mjs"]

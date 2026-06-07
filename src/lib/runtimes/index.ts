@@ -758,7 +758,7 @@ export const RUNTIME_CONFIGS: Record<RuntimeId, RuntimeConfig> = {
     label: "Node.js 20",
     description:
       "JavaScript con runtime de Node 20 (Express-style). Requiere redeploy al cambiar código.",
-    image: "node:20-alpine",
+    image: "mcr.microsoft.com/devcontainers/javascript-node:22",
     port: 8000,
     cpu: 0.5,
     memory: "1Gi",
