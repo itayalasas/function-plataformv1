@@ -1,0 +1,13 @@
+node_modules
+.output
+.nitro
+.tanstack
+dist
+.git
+.github
+.workspace
+.lovable
+.env
+.env.*
+*.log
+README.md

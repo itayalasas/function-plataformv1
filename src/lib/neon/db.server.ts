@@ -1,0 +1,176 @@
+import { neon, type NeonQueryFunction } from "@neondatabase/serverless";
+
+let _sql: NeonQueryFunction<false, false> | undefined;
+let _schemaReady: Promise<void> | undefined;
+
+export function sql(): NeonQueryFunction<false, false> {
+  if (!_sql) {
+    const url = process.env.NEON_DATABASE_URL;
+    if (!url) throw new Error("NEON_DATABASE_URL is not set");
+    _sql = neon(url);
+  }
+  return _sql;
+}
+
+const SCHEMA = `
+CREATE EXTENSION IF NOT EXISTS "pgcrypto";
+
+CREATE TABLE IF NOT EXISTS projects (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  owner_id text NOT NULL,
+  name text NOT NULL,
+  slug text NOT NULL,
+  container_app_name text,
+  fqdn text,
+  admin_token text,
+  last_deployed_at timestamptz,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  UNIQUE (owner_id, slug)
+);
+CREATE INDEX IF NOT EXISTS idx_projects_owner ON projects(owner_id);
+ALTER TABLE projects ADD COLUMN IF NOT EXISTS container_app_name text;
+ALTER TABLE projects ADD COLUMN IF NOT EXISTS fqdn text;
+ALTER TABLE projects ADD COLUMN IF NOT EXISTS admin_token text;
+ALTER TABLE projects ADD COLUMN IF NOT EXISTS last_deployed_at timestamptz;
+ALTER TABLE projects ADD COLUMN IF NOT EXISTS runtime text NOT NULL DEFAULT 'deno';
+
+
+CREATE TABLE IF NOT EXISTS functions (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  project_id uuid NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  owner_id text NOT NULL,
+  name text NOT NULL,
+  slug text NOT NULL,
+  entrypoint text NOT NULL DEFAULT 'index.ts',
+  status text NOT NULL DEFAULT 'draft',
+  current_deployment_id uuid,
+  container_app_name text,
+  fqdn text,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  UNIQUE (project_id, slug)
+);
+CREATE INDEX IF NOT EXISTS idx_functions_project ON functions(project_id);
+
+CREATE TABLE IF NOT EXISTS function_files (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  function_id uuid NOT NULL REFERENCES functions(id) ON DELETE CASCADE,
+  owner_id text NOT NULL,
+  path text NOT NULL,
+  kind text NOT NULL DEFAULT 'file',
+  content text NOT NULL DEFAULT '',
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  UNIQUE (function_id, path)
+);
+CREATE INDEX IF NOT EXISTS idx_files_fn ON function_files(function_id);
+ALTER TABLE function_files ADD COLUMN IF NOT EXISTS kind text NOT NULL DEFAULT 'file';
+
+CREATE TABLE IF NOT EXISTS secrets (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  project_id uuid NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  owner_id text NOT NULL,
+  name text NOT NULL,
+  value text NOT NULL,
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  UNIQUE (project_id, name)
+);
+
+CREATE TABLE IF NOT EXISTS function_tokens (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  function_id uuid NOT NULL REFERENCES functions(id) ON DELETE CASCADE,
+  owner_id text NOT NULL,
+  name text NOT NULL,
+  value text NOT NULL,
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  UNIQUE (function_id, name)
+);
+CREATE INDEX IF NOT EXISTS idx_tokens_fn ON function_tokens(function_id);
+
+CREATE TABLE IF NOT EXISTS deployments (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  function_id uuid REFERENCES functions(id) ON DELETE CASCADE,
+  project_id uuid REFERENCES projects(id) ON DELETE CASCADE,
+  owner_id text NOT NULL,
+  version int NOT NULL,
+  container_app_name text NOT NULL,
+  fqdn text,
+  status text NOT NULL DEFAULT 'provisioning',
+  error text,
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+ALTER TABLE deployments ADD COLUMN IF NOT EXISTS project_id uuid REFERENCES projects(id) ON DELETE CASCADE;
+ALTER TABLE deployments ADD COLUMN IF NOT EXISTS runtime text;
+ALTER TABLE deployments ALTER COLUMN function_id DROP NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_deployments_project ON deployments(project_id);
+
+CREATE TABLE IF NOT EXISTS invocation_logs (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  function_id uuid NOT NULL REFERENCES functions(id) ON DELETE CASCADE,
+  owner_id text NOT NULL,
+  method text NOT NULL,
+  path text NOT NULL,
+  status int,
+  duration_ms int,
+  error text,
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_logs_fn ON invocation_logs(function_id, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS system_logs (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  project_id uuid REFERENCES projects(id) ON DELETE CASCADE,
+  owner_id text NOT NULL,
+  level text NOT NULL,
+  source text NOT NULL,
+  message text NOT NULL,
+  meta jsonb,
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_syslogs_project ON system_logs(project_id, created_at DESC);
+`;
+
+/** Server-side helper: append a structured log entry. Never throws. */
+export async function logEvent(
+  projectId: string | null,
+  ownerId: string,
+  level: "info" | "warn" | "error" | "debug",
+  source: string,
+  message: string,
+  meta?: unknown,
+): Promise<void> {
+  try {
+    const s = sql();
+    const metaJson = meta === undefined ? null : JSON.stringify(meta);
+    await s`INSERT INTO system_logs (project_id, owner_id, level, source, message, meta)
+            VALUES (${projectId}, ${ownerId}, ${level}, ${source}, ${message}, ${metaJson}::jsonb)`;
+  } catch (e) {
+    console.error("[logEvent] failed", e);
+  }
+}
+
+
+export function ensureSchema(): Promise<void> {
+  if (!_schemaReady) {
+    const s = sql();
+    _schemaReady = (async () => {
+      // Neon HTTP requires single statement per query — split by ';'
+      for (const stmt of SCHEMA.split(/;\s*\n/).map((x) => x.trim()).filter(Boolean)) {
+        await s.query(stmt);
+      }
+    })().catch((err) => {
+      _schemaReady = undefined;
+      throw err;
+    });
+  }
+  return _schemaReady;
+}
+
+export function slugify(input: string): string {
+  return input
+    .toLowerCase()
+    .normalize("NFKD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 40) || "untitled";
+}

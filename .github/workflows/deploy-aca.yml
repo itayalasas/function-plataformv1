@@ -1,0 +1,75 @@
+name: Deploy to Azure Container Apps
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  # ---- Customize these (or set as repo variables/secrets) ----
+  AZURE_RESOURCE_GROUP: ${{ vars.AZURE_RESOURCE_GROUP }}
+  ACA_NAME:             ${{ vars.ACA_NAME }}            # e.g. sendcraft-web
+  ACA_ENVIRONMENT:      ${{ vars.ACA_ENVIRONMENT }}     # ACA managed env name
+  ACR_NAME:             ${{ vars.ACR_NAME }}            # Azure Container Registry (without .azurecr.io)
+  IMAGE_NAME:           ${{ vars.IMAGE_NAME || 'sendcraft-web' }}
+  AZURE_LOCATION:       ${{ vars.AZURE_LOCATION || 'northcentralus' }}
+  TARGET_PORT:          '8080'
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Azure login
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Set image tag
+        id: meta
+        run: |
+          echo "tag=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+          echo "image=${ACR_NAME}.azurecr.io/${IMAGE_NAME}:${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+
+      - name: ACR login
+        run: az acr login --name "$ACR_NAME"
+
+      - name: Build & push image
+        run: |
+          docker build -t "${{ steps.meta.outputs.image }}" \
+                       -t "${ACR_NAME}.azurecr.io/${IMAGE_NAME}:latest" .
+          docker push "${{ steps.meta.outputs.image }}"
+          docker push "${ACR_NAME}.azurecr.io/${IMAGE_NAME}:latest"
+
+      - name: Create or update Container App
+        run: |
+          set -e
+          if az containerapp show -g "$AZURE_RESOURCE_GROUP" -n "$ACA_NAME" >/dev/null 2>&1; then
+            echo "Updating existing Container App $ACA_NAME..."
+            az containerapp update \
+              -g "$AZURE_RESOURCE_GROUP" -n "$ACA_NAME" \
+              --image "${{ steps.meta.outputs.image }}"
+          else
+            echo "Creating Container App $ACA_NAME..."
+            az containerapp create \
+              -g "$AZURE_RESOURCE_GROUP" -n "$ACA_NAME" \
+              --environment "$ACA_ENVIRONMENT" \
+              --image "${{ steps.meta.outputs.image }}" \
+              --target-port "$TARGET_PORT" \
+              --ingress external \
+              --registry-server "${ACR_NAME}.azurecr.io" \
+              --min-replicas 1 --max-replicas 3 \
+              --cpu 0.5 --memory 1.0Gi
+          fi
+
+      - name: Show public URL
+        run: |
+          FQDN=$(az containerapp show -g "$AZURE_RESOURCE_GROUP" -n "$ACA_NAME" \
+            --query properties.configuration.ingress.fqdn -o tsv)
+          echo "🚀 Deployed: https://$FQDN"
+          echo "url=https://$FQDN" >> "$GITHUB_STEP_SUMMARY"
