@@ -12,6 +12,7 @@ COPY . .
 ENV NITRO_PRESET=node-server
 ENV NODE_ENV=production
 RUN npm run build
+RUN npm prune --omit=dev --omit=optional
 
 # --- Runtime stage ---
 FROM mcr.microsoft.com/devcontainers/javascript-node:22 AS runner
