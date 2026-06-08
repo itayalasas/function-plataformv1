@@ -72,6 +72,11 @@ you, set the repository variable `MANAGE_ACR_RBAC=true` and make sure the
 Azure identity in `AZURE_CREDENTIALS` has `Owner` or `User Access
 Administrator` on the registry or subscription.
 
+`.env.local` is only for local development. Docker and Azure Container Apps do
+not read it automatically because `.env*` files are excluded from the image.
+Set runtime values in the Container App itself or in the GitHub Actions
+deployment flow.
+
 Note: this workflow deploys the main web app container. Java function projects
 are deployed from the platform UI or with the Java deployment script in
 [scripts/deploy-java-fix.mjs](./scripts/deploy-java-fix.mjs).
@@ -92,6 +97,11 @@ Set these repository variables:
 Set this repository secret:
 
 - `AZURE_CREDENTIALS`
+
+For runtime environment variables inside the container, set them on the Azure
+Container App, for example with `az containerapp update --set-env-vars ...` or
+through the Azure Portal. Secrets should be added as Container App secrets and
+referenced as environment variables from there.
 
 ## Notes
 

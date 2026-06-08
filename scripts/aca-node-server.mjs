@@ -1,8 +1,14 @@
 import http from "node:http";
+import { createReadStream } from "node:fs";
+import { access } from "node:fs/promises";
+import { constants as fsConstants } from "node:fs";
+import path from "node:path";
 import { Readable } from "node:stream";
+import { pathToFileURL } from "node:url";
 
 const PORT = Number(process.env.PORT ?? 8080);
 const HOST = process.env.HOST ?? "0.0.0.0";
+const CLIENT_DIR = path.resolve(process.cwd(), "dist", "client");
 
 const LOADING_HTML = `<!doctype html>
 <html lang="en">
@@ -29,7 +35,8 @@ let serverReady = false;
 let serverLoadError;
 function getServer() {
   if (!serverPromise) {
-    serverPromise = import("./dist/server/server.js").then((mod) => mod.default ?? mod);
+    const serverBundlePath = path.resolve(process.cwd(), "dist", "server", "server.js");
+    serverPromise = import(pathToFileURL(serverBundlePath).href).then((mod) => mod.default ?? mod);
   }
   return serverPromise;
 }
@@ -72,6 +79,87 @@ function createRequest(nodeReq) {
   return new Request(url, init);
 }
 
+function contentTypeFor(filePath) {
+  switch (path.extname(filePath).toLowerCase()) {
+    case ".css":
+      return "text/css; charset=utf-8";
+    case ".js":
+    case ".mjs":
+      return "text/javascript; charset=utf-8";
+    case ".json":
+      return "application/json; charset=utf-8";
+    case ".svg":
+      return "image/svg+xml";
+    case ".png":
+      return "image/png";
+    case ".jpg":
+    case ".jpeg":
+      return "image/jpeg";
+    case ".gif":
+      return "image/gif";
+    case ".webp":
+      return "image/webp";
+    case ".ico":
+      return "image/x-icon";
+    case ".woff":
+      return "font/woff";
+    case ".woff2":
+      return "font/woff2";
+    case ".ttf":
+      return "font/ttf";
+    case ".map":
+      return "application/json; charset=utf-8";
+    default:
+      return "application/octet-stream";
+  }
+}
+
+function isStaticAsset(pathname) {
+  return pathname.startsWith("/assets/") || pathname === "/favicon.svg";
+}
+
+function resolveClientFile(pathname) {
+  const relativePath = pathname.replace(/^\/+/, "");
+  const filePath = path.resolve(CLIENT_DIR, relativePath);
+  const clientPrefix = CLIENT_DIR.endsWith(path.sep) ? CLIENT_DIR : `${CLIENT_DIR}${path.sep}`;
+  if (filePath !== CLIENT_DIR && !filePath.startsWith(clientPrefix)) {
+    return null;
+  }
+  return filePath;
+}
+
+async function tryServeStatic(nodeReq, nodeRes) {
+  const url = new URL(nodeReq.url ?? "/", `http://${nodeReq.headers.host ?? "localhost"}`);
+  if (!isStaticAsset(url.pathname)) return false;
+
+  const filePath = resolveClientFile(url.pathname);
+  if (!filePath) {
+    nodeRes.statusCode = 400;
+    nodeRes.setHeader("content-type", "text/plain; charset=utf-8");
+    nodeRes.end("Bad Request");
+    return true;
+  }
+
+  try {
+    await access(filePath, fsConstants.R_OK);
+  } catch {
+    nodeRes.statusCode = 404;
+    nodeRes.setHeader("content-type", "text/plain; charset=utf-8");
+    nodeRes.setHeader("cache-control", "no-store");
+    nodeRes.end("Not Found");
+    return true;
+  }
+
+  nodeRes.statusCode = 200;
+  nodeRes.setHeader("content-type", contentTypeFor(filePath));
+  nodeRes.setHeader(
+    "cache-control",
+    url.pathname.startsWith("/assets/") ? "public, max-age=31536000, immutable" : "public, max-age=3600",
+  );
+  createReadStream(filePath).pipe(nodeRes);
+  return true;
+}
+
 async function handleRequest(nodeReq, nodeRes) {
   try {
     const url = new URL(nodeReq.url ?? "/", `http://${nodeReq.headers.host ?? "localhost"}`);
@@ -80,6 +168,10 @@ async function handleRequest(nodeReq, nodeRes) {
       nodeRes.setHeader("content-type", "application/json; charset=utf-8");
       nodeRes.setHeader("cache-control", "no-store");
       nodeRes.end(JSON.stringify({ status: "ok", runtime: "web" }));
+      return;
+    }
+
+    if (await tryServeStatic(nodeReq, nodeRes)) {
       return;
     }
 
