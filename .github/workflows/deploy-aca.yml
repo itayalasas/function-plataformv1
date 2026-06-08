@@ -1,0 +1,107 @@
+name: Deploy to Azure Container Apps
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  AZURE_RESOURCE_GROUP: ${{ vars.AZURE_RESOURCE_GROUP }}
+  ACA_NAME:             ${{ vars.ACA_NAME }}
+  ACA_ENVIRONMENT:      ${{ vars.ACA_ENVIRONMENT }}
+  ACR_NAME:             ${{ vars.ACR_NAME }}
+  IMAGE_NAME:           ${{ vars.IMAGE_NAME || 'sendcraft-web' }}
+  AZURE_LOCATION:       ${{ vars.AZURE_LOCATION || 'northcentralus' }}
+  TARGET_PORT:          '8080'
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Azure login
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Set image tag
+        id: meta
+        run: |
+          echo "tag=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+          echo "image=${ACR_NAME}.azurecr.io/${IMAGE_NAME}:${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+
+      - name: ACR login
+        run: az acr login --name "$ACR_NAME"
+
+      - name: Build & push image
+        run: |
+          docker build -t "${{ steps.meta.outputs.image }}" \
+                       -t "${ACR_NAME}.azurecr.io/${IMAGE_NAME}:latest" .
+          docker push "${{ steps.meta.outputs.image }}"
+          docker push "${ACR_NAME}.azurecr.io/${IMAGE_NAME}:latest"
+
+      - name: Ensure Container App exists
+        run: |
+          set -e
+          if az containerapp show -g "$AZURE_RESOURCE_GROUP" -n "$ACA_NAME" >/dev/null 2>&1; then
+            echo "Container App $ACA_NAME already exists."
+          else
+            echo "Creating Container App shell $ACA_NAME..."
+            az containerapp create \
+              -g "$AZURE_RESOURCE_GROUP" \
+              -n "$ACA_NAME" \
+              --environment "$ACA_ENVIRONMENT" \
+              --image "mcr.microsoft.com/k8se/quickstart:latest" \
+              --target-port "$TARGET_PORT" \
+              --ingress external \
+              --min-replicas 1 \
+              --max-replicas 3 \
+              --cpu 0.5 \
+              --memory 1.0Gi
+          fi
+
+      - name: Enable ACR admin user
+        run: |
+          set -e
+          az acr update \
+            -n "$ACR_NAME" \
+            --admin-enabled true
+
+      - name: Configure ACR access
+        run: |
+          set -e
+
+          ACR_SERVER="${ACR_NAME}.azurecr.io"
+          ACR_USERNAME=$(az acr credential show -n "$ACR_NAME" --query username -o tsv)
+          ACR_PASSWORD=$(az acr credential show -n "$ACR_NAME" --query "passwords[0].value" -o tsv)
+
+          az containerapp registry set \
+            -g "$AZURE_RESOURCE_GROUP" \
+            -n "$ACA_NAME" \
+            --server "$ACR_SERVER" \
+            --username "$ACR_USERNAME" \
+            --password "$ACR_PASSWORD"
+
+      - name: Deploy private image
+        run: |
+          set -e
+          az containerapp update \
+            -g "$AZURE_RESOURCE_GROUP" \
+            -n "$ACA_NAME" \
+            --image "${{ steps.meta.outputs.image }}"
+
+      - name: Show public URL
+        run: |
+          FQDN=$(az containerapp show \
+            -g "$AZURE_RESOURCE_GROUP" \
+            -n "$ACA_NAME" \
+            --query properties.configuration.ingress.fqdn \
+            -o tsv)
+
+          echo "🚀 Deployed: https://$FQDN"
+          echo "url=https://$FQDN" >> "$GITHUB_STEP_SUMMARY"
