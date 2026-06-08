@@ -57,35 +57,6 @@ jobs:
           docker push "${{ steps.meta.outputs.image }}"
           docker push "${ACR_NAME}.azurecr.io/${IMAGE_NAME}:latest"
 
-      - name: Create Container App if missing
-        shell: bash
-        run: |
-          set -e
-
-          if az containerapp show \
-            --resource-group "$AZURE_RESOURCE_GROUP" \
-            --name "$ACA_NAME" >/dev/null 2>&1; then
-
-            echo "Container App already exists: $ACA_NAME"
-
-          else
-
-            echo "Creating Container App: $ACA_NAME"
-
-            az containerapp create \
-              --resource-group "$AZURE_RESOURCE_GROUP" \
-              --name "$ACA_NAME" \
-              --environment "$ACA_ENVIRONMENT" \
-              --image "mcr.microsoft.com/k8se/quickstart:latest" \
-              --target-port "$TARGET_PORT" \
-              --ingress external \
-              --min-replicas 1 \
-              --max-replicas 3 \
-              --cpu 0.5 \
-              --memory 1.0Gi
-
-          fi
-
       - name: Enable ACR admin user
         shell: bash
         run: |
@@ -98,6 +69,7 @@ jobs:
         shell: bash
         run: |
           ACR_SERVER="${ACR_NAME}.azurecr.io"
+
           ACR_USERNAME="$(az acr credential show \
             --name "$ACR_NAME" \
             --query username \
@@ -112,16 +84,43 @@ jobs:
           echo "username=${ACR_USERNAME}" >> "$GITHUB_OUTPUT"
           echo "password=${ACR_PASSWORD}" >> "$GITHUB_OUTPUT"
 
-      - name: Deploy image to Azure Container Apps
+      - name: Delete existing Container App
         shell: bash
         run: |
-          az containerapp update \
+          if az containerapp show \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --name "$ACA_NAME" >/dev/null 2>&1; then
+
+            echo "Deleting existing Container App: $ACA_NAME"
+
+            az containerapp delete \
+              --resource-group "$AZURE_RESOURCE_GROUP" \
+              --name "$ACA_NAME" \
+              --yes
+
+            echo "Waiting after delete..."
+            sleep 30
+          else
+            echo "Container App does not exist."
+          fi
+
+      - name: Create Container App with private image
+        shell: bash
+        run: |
+          az containerapp create \
             --resource-group "$AZURE_RESOURCE_GROUP" \
             --name "$ACA_NAME" \
+            --environment "$ACA_ENVIRONMENT" \
             --image "${{ steps.meta.outputs.image }}" \
             --registry-server "${{ steps.acr.outputs.server }}" \
             --registry-username "${{ steps.acr.outputs.username }}" \
-            --registry-password "${{ steps.acr.outputs.password }}"
+            --registry-password "${{ steps.acr.outputs.password }}" \
+            --target-port "$TARGET_PORT" \
+            --ingress external \
+            --min-replicas 1 \
+            --max-replicas 3 \
+            --cpu 0.5 \
+            --memory 1.0Gi
 
       - name: Show public URL
         shell: bash
