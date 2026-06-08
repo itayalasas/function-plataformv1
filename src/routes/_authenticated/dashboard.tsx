@@ -49,6 +49,10 @@ function parentPath(path: string): string {
   return parts.length > 1 ? parts.slice(0, -1).join("/") : "";
 }
 
+function normalizeValidationText(input: string): string {
+  return input.normalize("NFKD").replace(/[\u0300-\u036f]/g, "").toLowerCase();
+}
+
 function Dashboard() {
   const { user, signOut } = useAuth();
   const navigate = useNavigate();
@@ -1008,15 +1012,24 @@ function FunctionView({
       // Validate first so structural issues surface before we publish a new revision.
       // Known runner/env errors should not block deploy because deploy is what updates the runner.
       const v = await vfn({ data: { functionId } }).catch(() => ({ ok: true }));
-      const validationError = ((v as any).error ?? "") as string;
+      const validationResult = v as { ok: boolean; error?: string; code?: string };
+      const validationError = validationResult.error ?? "";
+      const normalizedValidationError = normalizeValidationText(validationError);
+      const validationCode = validationResult.code ?? "";
       const canDeployPastValidation =
-        validationError.includes("no está desplegado") ||
-        validationError.includes("Missing connection parameters") ||
-        validationError.includes("versión anterior del runner") ||
-        validationError.includes("AddrInUse") ||
-        validationError.includes("Address already in use");
-      if (!v.ok && validationError && !canDeployPastValidation) {
-        throw new Error(`Validación falló: ${(v as any).error}`);
+        validationCode === "PROJECT_NOT_DEPLOYED" ||
+        validationCode === "CONTAINER_UNAVAILABLE" ||
+        validationCode === "RUNNER_OUTDATED" ||
+        validationCode === "NETWORK_ERROR" ||
+        normalizedValidationError.includes("no esta desplegado") ||
+        normalizedValidationError.includes("missing connection parameters") ||
+        normalizedValidationError.includes("version anterior del runner") ||
+        normalizedValidationError.includes("addrinuse") ||
+        normalizedValidationError.includes("address already in use") ||
+        normalizedValidationError.includes("no se pudo validar porque el contenedor no responde") ||
+        normalizedValidationError.includes("no se pudo contactar con el contenedor");
+      if (!validationResult.ok && validationError && !canDeployPastValidation) {
+        throw new Error(`Validación falló: ${validationError}`);
       }
       return dep({ data: { projectId } });
     },

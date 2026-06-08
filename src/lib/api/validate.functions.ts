@@ -118,20 +118,6 @@ export const validateFunction = createServerFn({ method: "POST" })
     if (!fns[0]) throw new Error("Function not found");
     const fn = fns[0];
     const runtime = getRuntimeConfig(fn.runtime);
-    if (!fn.fqdn || !fn.admin_token) {
-      await logEvent(
-        fn.project_id,
-        context.userId,
-        "warn",
-        "validate",
-        `Validate "${fn.name}" - proyecto sin desplegar`,
-      );
-      return {
-        ok: false,
-        error:
-          "El proyecto aun no esta desplegado. Haz un primer deploy para activar la validacion en caliente.",
-      };
-    }
     const files =
       (await s`SELECT path, content, kind FROM function_files WHERE function_id = ${fn.id}`) as Array<{
         path: string;
@@ -175,6 +161,22 @@ export const validateFunction = createServerFn({ method: "POST" })
       }
     }
 
+    if (!fn.fqdn || !fn.admin_token) {
+      await logEvent(
+        fn.project_id,
+        context.userId,
+        "warn",
+        "validate",
+        `Validate "${fn.name}" - proyecto sin desplegar`,
+      );
+      return {
+        ok: false,
+        code: "PROJECT_NOT_DEPLOYED",
+        error:
+          "El proyecto aun no esta desplegado. Haz un primer deploy para activar la validacion en caliente.",
+      };
+    }
+
     const url = `https://${fn.fqdn}/__validate`;
     const healthUrl = `https://${fn.fqdn}/__health`;
     const startedAt = Date.now();
@@ -195,7 +197,7 @@ export const validateFunction = createServerFn({ method: "POST" })
           health: healthText.slice(0, 300),
           runtime: runtime.id,
         });
-        return { ok: false, error };
+        return { ok: false, code: "CONTAINER_UNAVAILABLE", error };
       }
 
       if (runtime.id !== "deno") {
@@ -221,7 +223,7 @@ export const validateFunction = createServerFn({ method: "POST" })
           health: healthText.slice(0, 300),
           expected: expectedRunnerVersion,
         });
-        return { ok: false, error };
+        return { ok: false, code: "RUNNER_OUTDATED", error };
       }
 
       const res = await fetch(url, {
@@ -257,6 +259,6 @@ export const validateFunction = createServerFn({ method: "POST" })
         "Fallo de red contactando contenedor",
         { error: msg, url },
       );
-      return { ok: false, error: `No se pudo contactar con el contenedor: ${msg}` };
+      return { ok: false, code: "NETWORK_ERROR", error: `No se pudo contactar con el contenedor: ${msg}` };
     }
   });
