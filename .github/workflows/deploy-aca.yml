@@ -2,59 +2,79 @@ name: Deploy to Azure Container Apps
 
 on:
   push:
-    branches: [main]
+    branches:
+      - main
   workflow_dispatch:
 
 env:
   AZURE_RESOURCE_GROUP: ${{ vars.AZURE_RESOURCE_GROUP }}
-  ACA_NAME:             ${{ vars.ACA_NAME }}
-  ACA_ENVIRONMENT:      ${{ vars.ACA_ENVIRONMENT }}
-  ACR_NAME:             ${{ vars.ACR_NAME }}
-  IMAGE_NAME:           ${{ vars.IMAGE_NAME || 'sendcraft-web' }}
-  AZURE_LOCATION:       ${{ vars.AZURE_LOCATION || 'northcentralus' }}
-  TARGET_PORT:          '8080'
+  ACA_NAME: ${{ vars.ACA_NAME }}
+  ACA_ENVIRONMENT: ${{ vars.ACA_ENVIRONMENT }}
+  ACR_NAME: ${{ vars.ACR_NAME }}
+  IMAGE_NAME: ${{ vars.IMAGE_NAME || 'sendcraft-web' }}
+  TARGET_PORT: "8080"
 
 jobs:
   build-and-deploy:
+    name: Build and Deploy
     runs-on: ubuntu-latest
+
     permissions:
       contents: read
 
     steps:
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Azure login
+      - name: Login to Azure
         uses: azure/login@v2
         with:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
 
-      - name: Set image tag
+      - name: Set image metadata
         id: meta
+        shell: bash
         run: |
-          echo "tag=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
-          echo "image=${ACR_NAME}.azurecr.io/${IMAGE_NAME}:${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+          IMAGE_TAG="${GITHUB_SHA::7}"
+          IMAGE_FULL_NAME="${ACR_NAME}.azurecr.io/${IMAGE_NAME}:${IMAGE_TAG}"
 
-      - name: ACR login
-        run: az acr login --name "$ACR_NAME"
+          echo "tag=${IMAGE_TAG}" >> "$GITHUB_OUTPUT"
+          echo "image=${IMAGE_FULL_NAME}" >> "$GITHUB_OUTPUT"
 
-      - name: Build & push image
+      - name: Login to Azure Container Registry
+        shell: bash
         run: |
-          docker build -t "${{ steps.meta.outputs.image }}" \
-                       -t "${ACR_NAME}.azurecr.io/${IMAGE_NAME}:latest" .
+          az acr login --name "$ACR_NAME"
+
+      - name: Build and push Docker image
+        shell: bash
+        run: |
+          docker build \
+            -t "${{ steps.meta.outputs.image }}" \
+            -t "${ACR_NAME}.azurecr.io/${IMAGE_NAME}:latest" \
+            .
+
           docker push "${{ steps.meta.outputs.image }}"
           docker push "${ACR_NAME}.azurecr.io/${IMAGE_NAME}:latest"
 
-      - name: Ensure Container App exists
+      - name: Create Container App if missing
+        shell: bash
         run: |
           set -e
-          if az containerapp show -g "$AZURE_RESOURCE_GROUP" -n "$ACA_NAME" >/dev/null 2>&1; then
-            echo "Container App $ACA_NAME already exists."
+
+          if az containerapp show \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --name "$ACA_NAME" >/dev/null 2>&1; then
+
+            echo "Container App already exists: $ACA_NAME"
+
           else
-            echo "Creating Container App shell $ACA_NAME..."
+
+            echo "Creating Container App: $ACA_NAME"
+
             az containerapp create \
-              -g "$AZURE_RESOURCE_GROUP" \
-              -n "$ACA_NAME" \
+              --resource-group "$AZURE_RESOURCE_GROUP" \
+              --name "$ACA_NAME" \
               --environment "$ACA_ENVIRONMENT" \
               --image "mcr.microsoft.com/k8se/quickstart:latest" \
               --target-port "$TARGET_PORT" \
@@ -63,45 +83,54 @@ jobs:
               --max-replicas 3 \
               --cpu 0.5 \
               --memory 1.0Gi
+
           fi
 
       - name: Enable ACR admin user
+        shell: bash
         run: |
-          set -e
           az acr update \
-            -n "$ACR_NAME" \
+            --name "$ACR_NAME" \
             --admin-enabled true
 
-      - name: Configure ACR access
+      - name: Get ACR credentials
+        id: acr
+        shell: bash
         run: |
-          set -e
-
           ACR_SERVER="${ACR_NAME}.azurecr.io"
-          ACR_USERNAME=$(az acr credential show -n "$ACR_NAME" --query username -o tsv)
-          ACR_PASSWORD=$(az acr credential show -n "$ACR_NAME" --query "passwords[0].value" -o tsv)
+          ACR_USERNAME="$(az acr credential show \
+            --name "$ACR_NAME" \
+            --query username \
+            --output tsv)"
 
-          az containerapp registry set \
-            -g "$AZURE_RESOURCE_GROUP" \
-            -n "$ACA_NAME" \
-            --server "$ACR_SERVER" \
-            --username "$ACR_USERNAME" \
-            --password "$ACR_PASSWORD"
+          ACR_PASSWORD="$(az acr credential show \
+            --name "$ACR_NAME" \
+            --query "passwords[0].value" \
+            --output tsv)"
 
-      - name: Deploy private image
+          echo "server=${ACR_SERVER}" >> "$GITHUB_OUTPUT"
+          echo "username=${ACR_USERNAME}" >> "$GITHUB_OUTPUT"
+          echo "password=${ACR_PASSWORD}" >> "$GITHUB_OUTPUT"
+
+      - name: Deploy image to Azure Container Apps
+        shell: bash
         run: |
-          set -e
           az containerapp update \
-            -g "$AZURE_RESOURCE_GROUP" \
-            -n "$ACA_NAME" \
-            --image "${{ steps.meta.outputs.image }}"
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --name "$ACA_NAME" \
+            --image "${{ steps.meta.outputs.image }}" \
+            --registry-server "${{ steps.acr.outputs.server }}" \
+            --registry-username "${{ steps.acr.outputs.username }}" \
+            --registry-password "${{ steps.acr.outputs.password }}"
 
       - name: Show public URL
+        shell: bash
         run: |
-          FQDN=$(az containerapp show \
-            -g "$AZURE_RESOURCE_GROUP" \
-            -n "$ACA_NAME" \
+          FQDN="$(az containerapp show \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --name "$ACA_NAME" \
             --query properties.configuration.ingress.fqdn \
-            -o tsv)
+            --output tsv)"
 
-          echo "🚀 Deployed: https://$FQDN"
-          echo "url=https://$FQDN" >> "$GITHUB_STEP_SUMMARY"
+          echo "Deployed: https://${FQDN}"
+          echo "url=https://${FQDN}" >> "$GITHUB_STEP_SUMMARY"

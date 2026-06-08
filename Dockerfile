@@ -1,30 +1,43 @@
 # --- Build stage ---
 # Use Microsoft-hosted base images so CI does not depend on Docker Hub.
 FROM mcr.microsoft.com/devcontainers/javascript-node:22 AS builder
+
 WORKDIR /app
 
-# Install deps (cacheable layer)
+# Install dependencies
+# NOTE:
+# package-lock.json is currently out of sync with package.json,
+# so we use npm install instead of npm ci.
 COPY package.json package-lock.json* ./
-RUN npm ci || npm install
+RUN npm install
 
-# Copy sources and build with Node server preset (Nitro)
+# Copy sources and build
 COPY . .
-ENV NITRO_PRESET=node-server
+
 ENV NODE_ENV=production
+ENV NITRO_PRESET=node-server
+
 RUN npm run build
+
+# Remove dev dependencies after build
 RUN npm prune --omit=dev --omit=optional
+
 
 # --- Runtime stage ---
 FROM mcr.microsoft.com/devcontainers/javascript-node:22 AS runner
+
 WORKDIR /app
+
 ENV NODE_ENV=production
 ENV PORT=8080
 ENV HOST=0.0.0.0
 
-# TanStack Start emits dist/server/server.js plus client/server assets.
+# Copy production build and runtime dependencies
 COPY --from=builder /app/dist ./dist
 COPY --from=builder /app/node_modules ./node_modules
+COPY --from=builder /app/package.json ./package.json
 COPY scripts/aca-node-server.mjs ./aca-node-server.mjs
 
 EXPOSE 8080
+
 CMD ["node", "aca-node-server.mjs"]
