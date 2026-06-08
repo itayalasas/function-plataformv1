@@ -62,7 +62,7 @@ The workflow:
 
 - builds the container image
 - pushes it to Azure Container Registry
-- creates or updates the Azure Container App
+- creates the Azure Container App on the first deploy, then updates the image in place on later deploys so existing env vars and secrets stay intact
 - prints the public FQDN in the workflow summary
 
 The container app must be able to pull from the private ACR. By default, the

@@ -253,6 +253,58 @@ interface AcaCustomDomain {
   certificateId?: string;
 }
 
+interface AcaSecret {
+  name: string;
+  value?: string;
+  keyVaultUrl?: string;
+  identity?: string;
+}
+
+interface AcaEnvVar {
+  name: string;
+  value?: string;
+  secretRef?: string;
+}
+
+function normalizeAcaSecretName(name: string): string {
+  return name.toLowerCase();
+}
+
+function mergeAcaSecrets(existing: AcaSecret[], incoming: AcaSecret[]): AcaSecret[] {
+  const merged = new Map<string, AcaSecret>();
+  for (const secret of existing) {
+    if (!secret?.name) continue;
+    merged.set(normalizeAcaSecretName(secret.name), secret);
+  }
+  for (const secret of incoming) {
+    if (!secret?.name) continue;
+    merged.set(normalizeAcaSecretName(secret.name), secret);
+  }
+  return Array.from(merged.values());
+}
+
+function mergeAcaEnvVars(
+  existing: AcaEnvVar[],
+  incoming: AcaEnvVar[],
+  availableSecretNames: Set<string>,
+): AcaEnvVar[] {
+  const merged = new Map<string, AcaEnvVar>();
+  for (const envVar of existing) {
+    if (!envVar?.name) continue;
+    const hasPlainValue = typeof envVar.value === "string";
+    const secretRef = typeof envVar.secretRef === "string" ? envVar.secretRef.trim() : "";
+    const hasResolvableSecret = secretRef.length > 0
+      && availableSecretNames.has(normalizeAcaSecretName(secretRef));
+    if (!hasPlainValue && !hasResolvableSecret) continue;
+    merged.set(envVar.name, envVar);
+  }
+  for (const envVar of incoming) {
+    if (!envVar?.name) continue;
+    merged.set(envVar.name, envVar);
+  }
+  return Array.from(merged.values());
+}
+
 /**
  * Create or update a Container App. Returns the FQDN once provisioned.
  */
@@ -284,7 +336,7 @@ export async function upsertContainerApp(input: DeployFunctionInput): Promise<De
   // revision when the template content changes.
   const revisionSuffix = sanitizeAcaName(`v${envCopy.DEPLOYMENT_VERSION ?? Date.now()}`, "v");
 
-  const envVars = [
+  const incomingEnvVars = [
     ...Object.entries(envCopy).map(([name, value]) => ({ name, value })),
     ...secretsArr.map((s) => ({ name: s.name.toUpperCase().replace(/-/g, "_"), secretRef: s.name })),
   ];
@@ -313,6 +365,31 @@ export async function upsertContainerApp(input: DeployFunctionInput): Promise<De
   const startupFailureThreshold = input.startupFailureThreshold ?? 30;
   const startupPeriodSeconds = input.startupPeriodSeconds ?? 5;
 
+  log("info", "Ensuring Azure infra (resource group + managed environment)", { env: e.environment });
+  await ensureInfra();
+  log("info", "Infra ready", { rg: e.resourceGroup, env: e.environment });
+
+  // Read existing app state before any delete/recreate path so we can preserve
+  // custom domains, env vars, and secrets that were configured outside the DB.
+  const existing = await getContainerApp(input.containerAppName);
+  const preservedCustomDomains: AcaCustomDomain[] = existing?.customDomainsRaw ?? [];
+  let preservedSecrets: AcaSecret[] = [];
+  if (existing) {
+    try {
+      preservedSecrets = await listContainerAppSecrets(input.containerAppName);
+    } catch (err) {
+      log("warn", "Could not read existing Container App secrets; falling back to deploy-time secrets only", {
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+  const mergedSecrets = mergeAcaSecrets(preservedSecrets, secretsArr);
+  const mergedEnvVars = mergeAcaEnvVars(
+    existing?.environmentVariables ?? [],
+    incomingEnvVars,
+    new Set(mergedSecrets.map((secret) => normalizeAcaSecretName(secret.name))),
+  );
+
   const body = {
     location: e.location,
     properties: {
@@ -326,7 +403,7 @@ export async function upsertContainerApp(input: DeployFunctionInput): Promise<De
           allowInsecure: false,
           traffic: [{ latestRevision: true, weight: 100 }],
         },
-        secrets: secretsArr,
+        secrets: mergedSecrets,
       },
       template: {
         revisionSuffix,
@@ -335,7 +412,7 @@ export async function upsertContainerApp(input: DeployFunctionInput): Promise<De
             name: "main",
             image: containerImage,
             resources: { cpu, memory },
-            env: envVars,
+            env: mergedEnvVars,
             command: ["/bin/sh", "-c"],
             args: [startupScript],
             probes: [
@@ -362,15 +439,6 @@ export async function upsertContainerApp(input: DeployFunctionInput): Promise<De
     },
   };
 
-  log("info", "Ensuring Azure infra (resource group + managed environment)", { env: e.environment });
-  await ensureInfra();
-  log("info", "Infra ready", { rg: e.resourceGroup, env: e.environment });
-
-  // Read existing app (if any) so we can PRESERVE custom domains across deploys.
-  // Azure ARM PUT replaces the entire ingress block, so any customDomains not
-  // included here would be wiped on each deploy.
-  const existing = await getContainerApp(input.containerAppName);
-  const preservedCustomDomains: AcaCustomDomain[] = existing?.customDomainsRaw ?? [];
   if (preservedCustomDomains.length) {
     log("info", "Preserving existing custom domains", { domains: preservedCustomDomains.map((d) => d.name) });
     (body.properties.configuration.ingress as Record<string, unknown>).customDomains = preservedCustomDomains;
@@ -449,6 +517,7 @@ export interface ContainerAppInfo {
   defaultFqdn: string | null;
   customDomains: string[];
   customDomainsRaw: AcaCustomDomain[];
+  environmentVariables: AcaEnvVar[];
   provisioningState: string;
 }
 
@@ -461,18 +530,30 @@ export async function getContainerApp(name: string): Promise<ContainerAppInfo | 
     properties?: {
       provisioningState?: string;
       configuration?: { ingress?: { fqdn?: string; customDomains?: AcaCustomDomain[] } };
+      template?: { containers?: Array<{ env?: AcaEnvVar[] }> };
     };
   };
   const defaultFqdn = data.properties?.configuration?.ingress?.fqdn ?? null;
   const customDomainsRaw = data.properties?.configuration?.ingress?.customDomains ?? [];
   const customDomains = customDomainsRaw.map((d) => d.name);
+  const environmentVariables = data.properties?.template?.containers?.[0]?.env ?? [];
   return {
     fqdn: customDomains[0] ?? defaultFqdn,
     defaultFqdn,
     customDomains,
     customDomainsRaw,
+    environmentVariables,
     provisioningState: data.properties?.provisioningState ?? "Unknown",
   };
+}
+
+async function listContainerAppSecrets(name: string): Promise<AcaSecret[]> {
+  const url = `${envBase()}/providers/Microsoft.App/containerApps/${name}/listSecrets?api-version=${API_VERSION}`;
+  const res = await armFetch(url, { method: "POST" });
+  if (res.status === 404) return [];
+  if (!res.ok) throw new Error(`Azure listSecrets failed: ${res.status} ${await res.text()}`);
+  const data = (await res.json()) as { value?: AcaSecret[] };
+  return data.value ?? [];
 }
 
 export async function deleteContainerApp(name: string): Promise<void> {

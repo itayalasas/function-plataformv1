@@ -84,43 +84,37 @@ jobs:
           echo "username=${ACR_USERNAME}" >> "$GITHUB_OUTPUT"
           echo "password=${ACR_PASSWORD}" >> "$GITHUB_OUTPUT"
 
-      - name: Delete existing Container App
+      - name: Create or update Container App
         shell: bash
         run: |
           if az containerapp show \
             --resource-group "$AZURE_RESOURCE_GROUP" \
             --name "$ACA_NAME" >/dev/null 2>&1; then
 
-            echo "Deleting existing Container App: $ACA_NAME"
+            echo "Updating existing Container App: $ACA_NAME"
 
-            az containerapp delete \
+            az containerapp update \
               --resource-group "$AZURE_RESOURCE_GROUP" \
               --name "$ACA_NAME" \
-              --yes
-
-            echo "Waiting after delete..."
-            sleep 30
+              --image "${{ steps.meta.outputs.image }}"
           else
-            echo "Container App does not exist."
-          fi
+            echo "Creating Container App: $ACA_NAME"
 
-      - name: Create Container App with private image
-        shell: bash
-        run: |
-          az containerapp create \
-            --resource-group "$AZURE_RESOURCE_GROUP" \
-            --name "$ACA_NAME" \
-            --environment "$ACA_ENVIRONMENT" \
-            --image "${{ steps.meta.outputs.image }}" \
-            --registry-server "${{ steps.acr.outputs.server }}" \
-            --registry-username "${{ steps.acr.outputs.username }}" \
-            --registry-password "${{ steps.acr.outputs.password }}" \
-            --target-port "$TARGET_PORT" \
-            --ingress external \
-            --min-replicas 1 \
-            --max-replicas 3 \
-            --cpu 0.5 \
-            --memory 1.0Gi
+            az containerapp create \
+              --resource-group "$AZURE_RESOURCE_GROUP" \
+              --name "$ACA_NAME" \
+              --environment "$ACA_ENVIRONMENT" \
+              --image "${{ steps.meta.outputs.image }}" \
+              --registry-server "${{ steps.acr.outputs.server }}" \
+              --registry-username "${{ steps.acr.outputs.username }}" \
+              --registry-password "${{ steps.acr.outputs.password }}" \
+              --target-port "$TARGET_PORT" \
+              --ingress external \
+              --min-replicas 1 \
+              --max-replicas 3 \
+              --cpu 0.5 \
+              --memory 1.0Gi
+          fi
 
       - name: Show public URL
         shell: bash
