@@ -87,6 +87,7 @@ jobs:
             exit 1
           fi
 
+
           if [ "$MANAGE_ACR_RBAC" = "true" ]; then
             ACR_ID=$(az acr show -n "$ACR_NAME" --query id -o tsv)
             echo "Granting AcrPull to $PRINCIPAL_ID on $ACR_ID..."
@@ -102,6 +103,11 @@ jobs:
           else
             echo "Skipping RBAC assignment. Ensure the Container App identity already has AcrPull on the registry."
           fi
+
+          echo "Granting AcrPull to $PRINCIPAL_ID on $ACR_ID..."
+        
+          echo "Waiting for RBAC propagation..."
+          sleep 20
 
           echo "Configuring Container App registry access..."
           az containerapp registry set \
