@@ -13,6 +13,7 @@ env:
   ACR_NAME:             ${{ vars.ACR_NAME }}            # Azure Container Registry (without .azurecr.io)
   IMAGE_NAME:           ${{ vars.IMAGE_NAME || 'sendcraft-web' }}
   AZURE_LOCATION:       ${{ vars.AZURE_LOCATION || 'northcentralus' }}
+  MANAGE_ACR_RBAC:      ${{ vars.MANAGE_ACR_RBAC || 'false' }}
   TARGET_PORT:          '8080'
 
 jobs:
@@ -67,7 +68,6 @@ jobs:
         run: |
           set -e
           ACR_SERVER="${ACR_NAME}.azurecr.io"
-          ACR_ID=$(az acr show -n "$ACR_NAME" --query id -o tsv)
 
           echo "Ensuring Container App identity..."
           az containerapp identity assign \
@@ -87,16 +87,21 @@ jobs:
             exit 1
           fi
 
-          echo "Granting AcrPull to $PRINCIPAL_ID on $ACR_ID..."
-          az role assignment create \
-            --assignee-object-id "$PRINCIPAL_ID" \
-            --assignee-principal-type ServicePrincipal \
-            --role AcrPull \
-            --scope "$ACR_ID" \
-            --only-show-errors || true
+          if [ "$MANAGE_ACR_RBAC" = "true" ]; then
+            ACR_ID=$(az acr show -n "$ACR_NAME" --query id -o tsv)
+            echo "Granting AcrPull to $PRINCIPAL_ID on $ACR_ID..."
+            az role assignment create \
+              --assignee-object-id "$PRINCIPAL_ID" \
+              --assignee-principal-type ServicePrincipal \
+              --role AcrPull \
+              --scope "$ACR_ID" \
+              --only-show-errors
 
-          echo "Waiting for RBAC propagation..."
-          sleep 20
+            echo "Waiting for RBAC propagation..."
+            sleep 20
+          else
+            echo "Skipping RBAC assignment. Ensure the Container App identity already has AcrPull on the registry."
+          fi
 
           echo "Configuring Container App registry access..."
           az containerapp registry set \

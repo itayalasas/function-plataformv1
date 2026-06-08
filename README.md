@@ -65,6 +65,13 @@ The workflow:
 - creates or updates the Azure Container App
 - prints the public FQDN in the workflow summary
 
+The container app must be able to pull from the private ACR. By default, the
+workflow assumes the Container App managed identity already has `AcrPull` on
+the registry. If you want GitHub Actions to create that role assignment for
+you, set the repository variable `MANAGE_ACR_RBAC=true` and make sure the
+Azure identity in `AZURE_CREDENTIALS` has `Owner` or `User Access
+Administrator` on the registry or subscription.
+
 Note: this workflow deploys the main web app container. Java function projects
 are deployed from the platform UI or with the Java deployment script in
 [scripts/deploy-java-fix.mjs](./scripts/deploy-java-fix.mjs).
@@ -79,6 +86,8 @@ Set these repository variables:
 - `ACR_NAME`
 - `IMAGE_NAME`
 - `AZURE_LOCATION`
+- `MANAGE_ACR_RBAC` optional, set to `true` only if the deployment identity
+  can write Azure role assignments
 
 Set this repository secret:
 
