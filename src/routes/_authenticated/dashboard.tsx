@@ -539,7 +539,7 @@ function DeploysTabPanel({ projectId }: { projectId: string }) {
   const deployments = useQuery({
     queryKey: ["deps", projectId],
     queryFn: () => ld({ data: { projectId } }),
-    refetchInterval: 5000,
+    refetchInterval: 15000,
   });
   const [expanded, setExpanded] = useState<Record<string, boolean>>({});
   const [query, setQuery] = useState("");
@@ -1568,7 +1568,8 @@ function SystemLogsPanel({ projectId }: { projectId: string }) {
   const logs = useQuery({
     queryKey: ["syslogs", projectId],
     queryFn: () => ls({ data: { projectId } }),
-    refetchInterval: 3000,
+    refetchInterval: 10000,
+    refetchIntervalInBackground: false,
   });
   const [expanded, setExpanded] = useState<Record<string, boolean>>({});
   const [query, setQuery] = useState("");

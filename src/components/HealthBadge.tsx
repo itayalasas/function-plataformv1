@@ -14,7 +14,7 @@ interface HealthBadgeProps {
 
 /**
  * Live health indicator that polls the deployed container's runtime-specific health endpoint.
- * Also auto-syncs DB status (deployments/functions) as a side effect.
+ * It is read-only and avoids extra writes while the dashboard is open.
  */
 export function HealthBadge({
   projectId,

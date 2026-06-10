@@ -99,7 +99,8 @@ export const validateFunction = createServerFn({ method: "POST" })
   .middleware([requireAuthSystemAuth])
   .inputValidator((d) => z.object({ functionId: z.string().uuid() }).parse(d))
   .handler(async ({ data, context }) => {
-    const expectedRunnerVersion = "2026-05-31-deno-serve-stub-preinstall";
+    // Must stay in sync with runner/main.ts and src/lib/runner-source.generated.ts.
+    const expectedRunnerVersion = "2026-05-31-health";
     await ensureSchema();
     const s = sql();
     const fns =

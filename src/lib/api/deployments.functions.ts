@@ -241,7 +241,7 @@ export const refreshDeploymentStatus = createServerFn({ method: "POST" })
 
 /**
  * Health-check the project's deployed container using the runtime-specific health path.
- * Also syncs DB status (deployments/functions/projects) so the UI stays in sync automatically.
+ * Read-only: returns status for the UI without writing back to the database.
  */
 export const checkProjectHealth = createServerFn({ method: "POST" })
   .middleware([requireAuthSystemAuth])
@@ -301,23 +301,6 @@ export const checkProjectHealth = createServerFn({ method: "POST" })
       status = "down";
     }
     const responseTime = Date.now() - started;
-
-    // Auto-sync DB so other parts of the UI reflect reality.
-    try {
-      const dbStatus =
-        status === "operational" ? "live" : status === "degraded" ? "degraded" : "stopped";
-      await s`UPDATE functions SET status = ${dbStatus} WHERE project_id = ${data.projectId}`;
-      await s`
-        UPDATE deployments SET status = ${dbStatus}
-        WHERE id = (
-          SELECT id FROM deployments
-          WHERE project_id = ${data.projectId} AND owner_id = ${context.userId}
-          ORDER BY version DESC LIMIT 1
-        )
-      `;
-    } catch {
-      // Best-effort; ignore.
-    }
 
     return { status, httpStatus, responseTime, body, fqdn, checkedAt: new Date().toISOString() };
   });
