@@ -183,6 +183,14 @@ module.exports = async function handler(req) {
 };
 `;
 
+const NODE_PACKAGE_JSON = `{
+  "name": "node-function",
+  "private": true,
+  "type": "commonjs",
+  "main": "index.js"
+}
+`;
+
 const PYTHON_STARTER = `# Edge function (Python 3.12). Define a 'handler(req)' function.
 # req is a dict: { method, url, headers, query, body, params }
 # Return a dict: { status?, headers?, body? }
@@ -770,7 +778,10 @@ export const RUNTIME_CONFIGS: Record<RuntimeId, RuntimeConfig> = {
     monacoLanguage: "javascript",
     multiFunction: true,
     requiresRedeploy: true,
-    starterFiles: [{ path: "index.js", content: NODE_STARTER }],
+    starterFiles: [
+      { path: "index.js", content: NODE_STARTER },
+      { path: "package.json", content: NODE_PACKAGE_JSON },
+    ],
     startupScript: startupNode(),
   },
   python: {
