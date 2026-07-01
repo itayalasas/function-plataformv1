@@ -2,12 +2,44 @@ import { neon, type NeonQueryFunction } from "@neondatabase/serverless";
 
 let _sql: NeonQueryFunction<false, false> | undefined;
 let _schemaReady: Promise<void> | undefined;
+let _warnedAboutPooledUrl = false;
+
+function derivePooledNeonUrl(rawUrl: string): string {
+  try {
+    const url = new URL(rawUrl);
+    const host = url.hostname.toLowerCase();
+    const isNeonHost = host.endsWith(".neon.tech") || host.endsWith(".neon.com");
+    if (!isNeonHost) return rawUrl;
+
+    const labels = host.split(".");
+    if (!labels[0]?.startsWith("ep-") || labels[0].includes("-pooler")) return rawUrl;
+
+    labels[0] = `${labels[0]}-pooler`;
+    url.hostname = labels.join(".");
+    if (!_warnedAboutPooledUrl) {
+      _warnedAboutPooledUrl = true;
+      console.warn(
+        "[db] Using a derived pooled Neon connection string. For app traffic, prefer a pooled URL with -pooler in the hostname.",
+      );
+    }
+    return url.toString();
+  } catch {
+    return rawUrl;
+  }
+}
+
+function getDatabaseUrl(): string {
+  const rawUrl =
+    process.env.NEON_DATABASE_URL_POOLER ||
+    process.env.NEON_DATABASE_URL ||
+    process.env.DATABASE_URL;
+  if (!rawUrl) throw new Error("NEON_DATABASE_URL is not set");
+  return derivePooledNeonUrl(rawUrl);
+}
 
 export function sql(): NeonQueryFunction<false, false> {
   if (!_sql) {
-    const url = process.env.NEON_DATABASE_URL;
-    if (!url) throw new Error("NEON_DATABASE_URL is not set");
-    _sql = neon(url);
+    _sql = neon(getDatabaseUrl());
   }
   return _sql;
 }
@@ -148,13 +180,14 @@ export async function logEvent(
   }
 }
 
-
 export function ensureSchema(): Promise<void> {
   if (!_schemaReady) {
     const s = sql();
     _schemaReady = (async () => {
       // Neon HTTP requires single statement per query — split by ';'
-      for (const stmt of SCHEMA.split(/;\s*\n/).map((x) => x.trim()).filter(Boolean)) {
+      for (const stmt of SCHEMA.split(/;\s*\n/)
+        .map((x) => x.trim())
+        .filter(Boolean)) {
         await s.query(stmt);
       }
     })().catch((err) => {
@@ -166,11 +199,13 @@ export function ensureSchema(): Promise<void> {
 }
 
 export function slugify(input: string): string {
-  return input
-    .toLowerCase()
-    .normalize("NFKD")
-    .replace(/[\u0300-\u036f]/g, "")
-    .replace(/[^a-z0-9]+/g, "-")
-    .replace(/^-+|-+$/g, "")
-    .slice(0, 40) || "untitled";
+  return (
+    input
+      .toLowerCase()
+      .normalize("NFKD")
+      .replace(/[\u0300-\u036f]/g, "")
+      .replace(/[^a-z0-9]+/g, "-")
+      .replace(/^-+|-+$/g, "")
+      .slice(0, 40) || "untitled"
+  );
 }
