@@ -8,6 +8,7 @@ interface TokenCache {
 let _tokenCache: TokenCache | undefined;
 
 const API_VERSION = "2024-03-01";
+const LIFECYCLE_API_VERSION = "2026-01-01";
 
 interface AzureEnv {
   tenantId: string;
@@ -119,6 +120,14 @@ async function armFetch(url: string, init?: RequestInit): Promise<Response> {
   headers.set("Authorization", `Bearer ${token}`);
   if (init?.body && !headers.has("content-type")) headers.set("content-type", "application/json");
   return fetch(url, { ...init, headers });
+}
+
+function containerAppResourceUrl(name: string, apiVersion = API_VERSION): string {
+  return `${envBase()}/providers/Microsoft.App/containerApps/${name}?api-version=${apiVersion}`;
+}
+
+function containerAppActionUrl(name: string, action: "start" | "stop", apiVersion = LIFECYCLE_API_VERSION): string {
+  return `${envBase()}/providers/Microsoft.App/containerApps/${name}/${action}?api-version=${apiVersion}`;
 }
 
 // ---------- Auto-provisioning of Resource Group + Managed Environment ----------
@@ -311,7 +320,7 @@ function mergeAcaEnvVars(
 export async function upsertContainerApp(input: DeployFunctionInput): Promise<DeployResult> {
   const log = input.log ?? (() => {});
   const e = azureEnv();
-  const url = `${envBase()}/providers/Microsoft.App/containerApps/${input.containerAppName}?api-version=${API_VERSION}`;
+  const url = containerAppResourceUrl(input.containerAppName);
 
   const secretsArr = Object.entries(input.secrets).map(([name, value]) => ({
     name: name.toLowerCase().replace(/[^a-z0-9-]/g, "-"),
@@ -519,16 +528,18 @@ export interface ContainerAppInfo {
   customDomainsRaw: AcaCustomDomain[];
   environmentVariables: AcaEnvVar[];
   provisioningState: string;
+  runningStatus: string;
 }
 
 export async function getContainerApp(name: string): Promise<ContainerAppInfo | null> {
-  const url = `${envBase()}/providers/Microsoft.App/containerApps/${name}?api-version=${API_VERSION}`;
+  const url = containerAppResourceUrl(name);
   const res = await armFetch(url);
   if (res.status === 404) return null;
   if (!res.ok) throw new Error(`Azure get failed: ${res.status} ${await res.text()}`);
   const data = (await res.json()) as {
     properties?: {
       provisioningState?: string;
+      runningStatus?: string;
       configuration?: { ingress?: { fqdn?: string; customDomains?: AcaCustomDomain[] } };
       template?: { containers?: Array<{ env?: AcaEnvVar[] }> };
     };
@@ -544,6 +555,7 @@ export async function getContainerApp(name: string): Promise<ContainerAppInfo | 
     customDomainsRaw,
     environmentVariables,
     provisioningState: data.properties?.provisioningState ?? "Unknown",
+    runningStatus: data.properties?.runningStatus ?? "Unknown",
   };
 }
 
@@ -557,9 +569,64 @@ async function listContainerAppSecrets(name: string): Promise<AcaSecret[]> {
 }
 
 export async function deleteContainerApp(name: string): Promise<void> {
-  const url = `${envBase()}/providers/Microsoft.App/containerApps/${name}?api-version=${API_VERSION}`;
+  const url = containerAppResourceUrl(name);
   const res = await armFetch(url, { method: "DELETE" });
   if (!res.ok && res.status !== 404) {
     throw new Error(`Azure delete failed: ${res.status} ${await res.text()}`);
   }
+}
+
+async function waitForContainerAppRunningStatus(
+  name: string,
+  expected: "Running" | "Stopped",
+  timeoutMs = 120_000,
+): Promise<ContainerAppInfo> {
+  const deadline = Date.now() + timeoutMs;
+  let lastInfo: ContainerAppInfo | null = null;
+
+  while (Date.now() < deadline) {
+    const info = await getContainerApp(name);
+    if (!info) throw new Error(`Container App not found: ${name}`);
+    lastInfo = info;
+    if (info.runningStatus === expected) return info;
+    await new Promise((resolve) => setTimeout(resolve, 2500));
+  }
+
+  return lastInfo ?? (await getContainerApp(name)) ?? {
+    fqdn: null,
+    defaultFqdn: null,
+    customDomains: [],
+    customDomainsRaw: [],
+    environmentVariables: [],
+    provisioningState: "Unknown",
+    runningStatus: "Unknown",
+  };
+}
+
+export async function startContainerApp(name: string): Promise<ContainerAppInfo> {
+  const url = containerAppActionUrl(name, "start");
+  const res = await armFetch(url, { method: "POST" });
+  if (!res.ok && res.status !== 202 && res.status !== 200) {
+    throw new Error(`Azure start failed: ${res.status} ${await res.text()}`);
+  }
+  return waitForContainerAppRunningStatus(name, "Running");
+}
+
+export async function stopContainerApp(name: string): Promise<ContainerAppInfo> {
+  const url = containerAppActionUrl(name, "stop");
+  const res = await armFetch(url, { method: "POST" });
+  if (!res.ok && res.status !== 202 && res.status !== 200) {
+    throw new Error(`Azure stop failed: ${res.status} ${await res.text()}`);
+  }
+  return waitForContainerAppRunningStatus(name, "Stopped");
+}
+
+export async function restartContainerApp(name: string): Promise<ContainerAppInfo> {
+  const current = await getContainerApp(name);
+  if (!current) throw new Error(`Container App not found: ${name}`);
+  if (current.runningStatus === "Stopped") {
+    return startContainerApp(name);
+  }
+  await stopContainerApp(name);
+  return startContainerApp(name);
 }

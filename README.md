@@ -53,6 +53,78 @@ bun run lint
 bun run format
 ```
 
+## Local deploy CLI
+
+This repo now includes a command-line deploy helper that syncs local function
+folders into the platform and then triggers the same project deploy flow used
+by the web UI.
+
+Create a project link once:
+
+```bash
+npm run vortex -- link --project-id <project-uuid> --source-root functions
+```
+
+Then deploy everything in that local root:
+
+```bash
+npm run vortex -- deploy
+```
+
+Or deploy a single function folder:
+
+```bash
+npm run vortex -- deploy hello-world
+```
+
+Expected layout:
+
+```text
+functions/
+  hello-world/
+    index.ts
+    _shared/
+      utils.ts
+  another-function/
+    index.ts
+```
+
+The CLI only includes `_shared` when the function entrypoint imports it.
+If the function already has its own `_shared` folder, that version is used.
+If not, the CLI can source a shared `_shared` folder from the project tree
+and materialize it inside the function bundle.
+
+If a function needs a custom entrypoint, add a `vortex.json` file inside that
+function folder:
+
+```json
+{
+  "entrypoint": "src/main/java/com/example/App.java"
+}
+```
+
+The CLI reads `.vortex/.env`, `.env.local`, and `.env` from the project root,
+so the same Neon and Azure variables used by the web app are reused
+automatically. The web installer writes the hidden `.vortex/.env` file for you
+when the platform has those values configured.
+
+### Web installer
+
+If you want to install the CLI into another project without copying the
+`scripts/` folder manually, open the dashboard and click `Instalar CLI`.
+That downloads a self-contained `vortex-install.mjs` installer.
+
+Run it once from the root of the target project:
+
+```bash
+node vortex-install.mjs
+```
+
+The installer creates `.vortex/cli`, installs the local CLI dependencies,
+adds `.vortex/` to `.gitignore`, writes a hidden `.vortex/.env` with the
+platform connection values, and injects an `npm run vortex` script when the
+project already has a `package.json`.
+
 ## Azure deployment
 
 This repo ships with a GitHub Actions workflow at

@@ -15,6 +15,7 @@ import { Route as AuthenticatedRouteImport } from './routes/_authenticated'
 import { Route as IndexRouteImport } from './routes/index'
 import { Route as AuthenticatedDashboardRouteImport } from './routes/_authenticated/dashboard'
 import { Route as AuthenticatedAppRouteImport } from './routes/_authenticated/app'
+import { Route as ApiCliInstallerRouteImport } from './routes/api/cli/installer'
 import { Route as ApiProjectsProjectIdExportRouteImport } from './routes/api/projects/$projectId/export'
 
 const LoginRoute = LoginRouteImport.update({
@@ -46,6 +47,11 @@ const AuthenticatedAppRoute = AuthenticatedAppRouteImport.update({
   path: '/app',
   getParentRoute: () => AuthenticatedRoute,
 } as any)
+const ApiCliInstallerRoute = ApiCliInstallerRouteImport.update({
+  id: '/api/cli/installer',
+  path: '/api/cli/installer',
+  getParentRoute: () => rootRouteImport,
+} as any)
 const ApiProjectsProjectIdExportRoute =
   ApiProjectsProjectIdExportRouteImport.update({
     id: '/api/projects/$projectId/export',
@@ -59,6 +65,7 @@ export interface FileRoutesByFullPath {
   '/login': typeof LoginRoute
   '/app': typeof AuthenticatedAppRoute
   '/dashboard': typeof AuthenticatedDashboardRoute
+  '/api/cli/installer': typeof ApiCliInstallerRoute
   '/api/projects/$projectId/export': typeof ApiProjectsProjectIdExportRoute
 }
 export interface FileRoutesByTo {
@@ -67,6 +74,7 @@ export interface FileRoutesByTo {
   '/login': typeof LoginRoute
   '/app': typeof AuthenticatedAppRoute
   '/dashboard': typeof AuthenticatedDashboardRoute
+  '/api/cli/installer': typeof ApiCliInstallerRoute
   '/api/projects/$projectId/export': typeof ApiProjectsProjectIdExportRoute
 }
 export interface FileRoutesById {
@@ -77,6 +85,7 @@ export interface FileRoutesById {
   '/login': typeof LoginRoute
   '/_authenticated/app': typeof AuthenticatedAppRoute
   '/_authenticated/dashboard': typeof AuthenticatedDashboardRoute
+  '/api/cli/installer': typeof ApiCliInstallerRoute
   '/api/projects/$projectId/export': typeof ApiProjectsProjectIdExportRoute
 }
 export interface FileRouteTypes {
@@ -87,6 +96,7 @@ export interface FileRouteTypes {
     | '/login'
     | '/app'
     | '/dashboard'
+    | '/api/cli/installer'
     | '/api/projects/$projectId/export'
   fileRoutesByTo: FileRoutesByTo
   to:
@@ -95,6 +105,7 @@ export interface FileRouteTypes {
     | '/login'
     | '/app'
     | '/dashboard'
+    | '/api/cli/installer'
     | '/api/projects/$projectId/export'
   id:
     | '__root__'
@@ -104,6 +115,7 @@ export interface FileRouteTypes {
     | '/login'
     | '/_authenticated/app'
     | '/_authenticated/dashboard'
+    | '/api/cli/installer'
     | '/api/projects/$projectId/export'
   fileRoutesById: FileRoutesById
 }
@@ -112,6 +124,7 @@ export interface RootRouteChildren {
   AuthenticatedRoute: typeof AuthenticatedRouteWithChildren
   CallbackRoute: typeof CallbackRoute
   LoginRoute: typeof LoginRoute
+  ApiCliInstallerRoute: typeof ApiCliInstallerRoute
   ApiProjectsProjectIdExportRoute: typeof ApiProjectsProjectIdExportRoute
 }
 
@@ -159,6 +172,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof AuthenticatedAppRouteImport
       parentRoute: typeof AuthenticatedRoute
     }
+    '/api/cli/installer': {
+      id: '/api/cli/installer'
+      path: '/api/cli/installer'
+      fullPath: '/api/cli/installer'
+      preLoaderRoute: typeof ApiCliInstallerRouteImport
+      parentRoute: typeof rootRouteImport
+    }
     '/api/projects/$projectId/export': {
       id: '/api/projects/$projectId/export'
       path: '/api/projects/$projectId/export'
@@ -188,6 +208,7 @@ const rootRouteChildren: RootRouteChildren = {
   AuthenticatedRoute: AuthenticatedRouteWithChildren,
   CallbackRoute: CallbackRoute,
   LoginRoute: LoginRoute,
+  ApiCliInstallerRoute: ApiCliInstallerRoute,
   ApiProjectsProjectIdExportRoute: ApiProjectsProjectIdExportRoute,
 }
 export const routeTree = rootRouteImport

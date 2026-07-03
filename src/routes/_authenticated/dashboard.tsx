@@ -25,7 +25,15 @@ import { ScrollArea } from "@/components/ui/scroll-area";
 
 import { useAuth } from "@/hooks/use-auth";
 import { getAccessToken } from "@/lib/auth/auth-system";
-import { listProjects, createProject, deleteProject } from "@/lib/api/projects.functions";
+import {
+  listProjects,
+  createProject,
+  deleteProject,
+  getProjectContainerAppStatus,
+  startProjectContainerApp,
+  stopProjectContainerApp,
+  restartProjectContainerApp,
+} from "@/lib/api/projects.functions";
 import { listFunctions, createFunction, deleteFunction } from "@/lib/api/functions.functions";
 import { listFiles, upsertFile, createDirectory, deleteFile, renameFile } from "@/lib/api/files.functions";
 import { FileTree } from "@/components/FileTree";
@@ -84,6 +92,43 @@ function triggerDownload(blob: Blob, filename: string): void {
   window.setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 
+function containerAppStatusMeta(status: string | null | undefined) {
+  const normalized = (status ?? "unknown").toLowerCase();
+  switch (normalized) {
+    case "running":
+      return {
+        label: "viva",
+        className: "border-success/30 bg-success/10 text-success",
+        dotClass: "bg-success",
+      };
+    case "stopped":
+      return {
+        label: "parada",
+        className: "border-destructive/30 bg-destructive/10 text-destructive",
+        dotClass: "bg-destructive",
+      };
+    case "progressing":
+      return {
+        label: "arrancando",
+        className: "border-amber-500/30 bg-amber-500/10 text-amber-500",
+        dotClass: "bg-amber-500 animate-pulse",
+      };
+    case "not deployed":
+    case "missing":
+      return {
+        label: "sin deploy",
+        className: "border-border bg-background/70 text-muted-foreground",
+        dotClass: "bg-muted-foreground/50",
+      };
+    default:
+      return {
+        label: status ?? "desconocido",
+        className: "border-border bg-background/70 text-muted-foreground",
+        dotClass: "bg-muted-foreground/50",
+      };
+  }
+}
+
 function Dashboard() {
   const { user, signOut } = useAuth();
   const navigate = useNavigate();
@@ -92,6 +137,7 @@ function Dashboard() {
   const [projectId, setProjectId] = useState<string | null>(null);
   const [functionId, setFunctionId] = useState<string | null>(null);
   const [activeFile, setActiveFile] = useState<string>("index.ts");
+  const [installingCli, setInstallingCli] = useState(false);
 
   const lp = useServerFn(listProjects);
   const projects = useQuery({
@@ -112,6 +158,49 @@ function Dashboard() {
   });
 
   const currentProject = projects.data?.find((p) => p.id === projectId) ?? null;
+
+  const downloadCliInstaller = async () => {
+    if (installingCli) return;
+
+    const token = getAccessToken();
+    if (!token) {
+      toast.error("No se encontró el token de sesión. Vuelve a iniciar sesión.");
+      return;
+    }
+
+    setInstallingCli(true);
+    try {
+      const res = await fetch("/api/cli/installer", {
+        method: "GET",
+        headers: {
+          Authorization: `Bearer ${token}`,
+        },
+      });
+
+      if (!res.ok) {
+        const text = await res.text();
+        let message = text || `Error ${res.status}`;
+        try {
+          const parsed = JSON.parse(text) as { error?: string; message?: string };
+          message = parsed.error ?? parsed.message ?? message;
+        } catch {
+          // keep raw response text
+        }
+        throw new Error(message);
+      }
+
+      const blob = await res.blob();
+      const filename =
+        filenameFromContentDisposition(res.headers.get("content-disposition")) ??
+        "vortex-install.mjs";
+      triggerDownload(blob, filename);
+      toast.success("Instalador descargado");
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "No se pudo descargar el instalador");
+    } finally {
+      setInstallingCli(false);
+    }
+  };
 
   return (
     <div className="h-screen overflow-hidden bg-background flex">
@@ -190,6 +279,8 @@ function Dashboard() {
             setFunctionId={(id) => { setFunctionId(id); setActiveFile("index.ts"); }}
             activeFile={activeFile}
             setActiveFile={setActiveFile}
+            onInstallCli={downloadCliInstaller}
+            installingCli={installingCli}
             onProjectDeleted={() => {
               setProjectId(null);
               setFunctionId(null);
@@ -207,6 +298,8 @@ function Dashboard() {
               setFunctionId(null);
               setActiveFile("index.ts");
             }}
+            onInstallCli={downloadCliInstaller}
+            installingCli={installingCli}
           />
         )}
       </main>
@@ -284,7 +377,7 @@ function NewProjectDialog({ onCreated }: { onCreated: (id: string) => void }) {
 }
 
 function ProjectView({
-  projectId, projectSlug, projectRuntime, functionId, setFunctionId, activeFile, setActiveFile, onProjectDeleted,
+  projectId, projectSlug, projectRuntime, functionId, setFunctionId, activeFile, setActiveFile, onInstallCli, installingCli, onProjectDeleted,
 }: {
   projectId: string;
   projectSlug: string;
@@ -293,6 +386,8 @@ function ProjectView({
   setFunctionId: (id: string | null) => void;
   activeFile: string;
   setActiveFile: (p: string) => void;
+  onInstallCli: () => void;
+  installingCli: boolean;
   onProjectDeleted: () => void;
 }) {
   const qc = useQueryClient();
@@ -302,9 +397,24 @@ function ProjectView({
   const dp = useServerFn(deleteProject);
   const runtime = getRuntimeConfig(projectRuntime);
   const [exporting, setExporting] = useState(false);
+  const loadProjectAppStatus = useServerFn(getProjectContainerAppStatus);
+  const startProjectApp = useServerFn(startProjectContainerApp);
+  const stopProjectApp = useServerFn(stopProjectContainerApp);
+  const restartProjectApp = useServerFn(restartProjectContainerApp);
 
   const fns = useQuery({ queryKey: ["fns", projectId], queryFn: () => lf({ data: { projectId } }) });
+  const projectAppStatus = useQuery({
+    queryKey: ["project-app", projectId],
+    queryFn: () => loadProjectAppStatus({ data: { projectId } }),
+    staleTime: 5_000,
+    refetchInterval: 15_000,
+  });
   const canCreateFunction = runtime.id !== "java" || fns.data?.length === 0;
+  const appRunningStatus = projectAppStatus.data?.runningStatus ?? "Unknown";
+  const appStatusMeta = containerAppStatusMeta(appRunningStatus);
+  const appHasContainer = Boolean(projectAppStatus.data?.containerAppName);
+  const appIsRunning = appRunningStatus.toLowerCase() === "running";
+  const appIsStopped = appRunningStatus.toLowerCase() === "stopped";
 
   // Note: no auto-select — user lands on the functions list and picks one explicitly.
 
@@ -321,6 +431,54 @@ function ProjectView({
     },
     onError: (e) => toast.error(e instanceof Error ? e.message : "Error"),
   });
+
+  const refreshProjectAppState = () => {
+    qc.invalidateQueries({ queryKey: ["project-app", projectId] });
+    qc.invalidateQueries({ queryKey: ["projects"] });
+    qc.invalidateQueries({ queryKey: ["dashboard"] });
+  };
+
+  const copyProjectId = async () => {
+    try {
+      await navigator.clipboard.writeText(projectId);
+      toast.success("Project ID copiado");
+    } catch {
+      toast.error("No se pudo copiar el Project ID");
+    }
+  };
+
+  const startAppMut = useMutation({
+    mutationFn: () => startProjectApp({ data: { projectId } }),
+    onSuccess: () => {
+      toast.success("Container app iniciada");
+      refreshProjectAppState();
+    },
+    onError: (e) => toast.error(e instanceof Error ? e.message : "Error"),
+  });
+
+  const stopAppMut = useMutation({
+    mutationFn: () => stopProjectApp({ data: { projectId } }),
+    onSuccess: () => {
+      toast.success("Container app detenida");
+      refreshProjectAppState();
+    },
+    onError: (e) => toast.error(e instanceof Error ? e.message : "Error"),
+  });
+
+  const restartAppMut = useMutation({
+    mutationFn: () => restartProjectApp({ data: { projectId } }),
+    onSuccess: () => {
+      toast.success("Container app reiniciada");
+      refreshProjectAppState();
+    },
+    onError: (e) => toast.error(e instanceof Error ? e.message : "Error"),
+  });
+
+  const appIsBusy =
+    projectAppStatus.isLoading ||
+    startAppMut.isPending ||
+    stopAppMut.isPending ||
+    restartAppMut.isPending;
 
   const exportProject = async () => {
     const token = getAccessToken();
@@ -408,6 +566,17 @@ function ProjectView({
             size="sm"
             variant="outline"
             className="gap-1"
+            onClick={onInstallCli}
+            disabled={installingCli}
+            title="Descarga el instalador del CLI local"
+          >
+            {installingCli ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Download className="w-3.5 h-3.5" />}
+            Instalar CLI
+          </Button>
+          <Button
+            size="sm"
+            variant="outline"
+            className="gap-1"
             onClick={exportProject}
             disabled={exporting}
             title="Descarga un ZIP con todas las funciones del proyecto"
@@ -425,6 +594,84 @@ function ProjectView({
           </Button>
         </div>
       </header>
+
+      <div className="border-b border-border/60 bg-background/50 px-4 py-3 flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
+        <div className="flex flex-wrap items-center gap-3">
+          <div className="flex flex-col gap-1">
+            <span className="text-[11px] uppercase tracking-[0.28em] text-muted-foreground">
+              Project ID
+            </span>
+            <button
+              type="button"
+              onClick={copyProjectId}
+              className="inline-flex max-w-full items-center gap-2 rounded-md border border-border/70 bg-background/80 px-3 py-2 text-left transition hover:border-primary/50 hover:bg-background"
+              title="Copiar Project ID"
+            >
+              <span className="max-w-[280px] truncate font-mono text-xs text-foreground">
+                {projectId}
+              </span>
+              <Copy className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+            </button>
+          </div>
+          <Badge className={`gap-1 border ${appStatusMeta.className}`}>
+            <span className={`h-2 w-2 rounded-full ${appStatusMeta.dotClass}`} />
+            {appStatusMeta.label}
+          </Badge>
+          <span className="text-xs text-muted-foreground">
+            {projectAppStatus.data?.containerAppName
+              ? projectAppStatus.data.containerAppName
+              : "Aún sin container app"}
+          </span>
+        </div>
+
+        <div className="flex flex-wrap items-center gap-2">
+          <Button
+            size="sm"
+            variant="outline"
+            className="gap-1"
+            onClick={() => startAppMut.mutate()}
+            disabled={!appHasContainer || appIsBusy || appIsRunning}
+            title={!appHasContainer ? "Primero debes desplegar el proyecto" : "Correr container app"}
+          >
+            {startAppMut.isPending ? (
+              <Loader2 className="h-3.5 w-3.5 animate-spin" />
+            ) : (
+              <Play className="h-3.5 w-3.5" />
+            )}
+            Correr
+          </Button>
+          <Button
+            size="sm"
+            variant="outline"
+            className="gap-1"
+            onClick={() => stopAppMut.mutate()}
+            disabled={!appHasContainer || appIsBusy || appIsStopped}
+            title={!appHasContainer ? "Primero debes desplegar el proyecto" : "Parar container app"}
+          >
+            {stopAppMut.isPending ? (
+              <Loader2 className="h-3.5 w-3.5 animate-spin" />
+            ) : (
+              <XCircle className="h-3.5 w-3.5" />
+            )}
+            Parar
+          </Button>
+          <Button
+            size="sm"
+            variant="outline"
+            className="gap-1"
+            onClick={() => restartAppMut.mutate()}
+            disabled={!appHasContainer || appIsBusy}
+            title={!appHasContainer ? "Primero debes desplegar el proyecto" : "Reiniciar container app"}
+          >
+            {restartAppMut.isPending ? (
+              <Loader2 className="h-3.5 w-3.5 animate-spin" />
+            ) : (
+              <RefreshCw className="h-3.5 w-3.5" />
+            )}
+            Reiniciar
+          </Button>
+        </div>
+      </div>
 
       {fns.data && fns.data.length > 0 ? (
         <FunctionsAndEditor

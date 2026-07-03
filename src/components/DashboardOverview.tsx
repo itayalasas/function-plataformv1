@@ -5,6 +5,7 @@ import {
   Activity,
   ArrowRight,
   CheckCircle2,
+  Download,
   FileCode,
   Loader2,
   RefreshCw,
@@ -51,11 +52,19 @@ interface DashboardOverviewProps {
   projects: DashboardProject[];
   loading?: boolean;
   onOpenProject: (projectId: string) => void;
+  onInstallCli: () => void;
+  installingCli?: boolean;
 }
 
 type HealthStatus = ProjectHealth["status"] | "checking" | "unknown";
 
-export function DashboardOverview({ projects, loading = false, onOpenProject }: DashboardOverviewProps) {
+export function DashboardOverview({
+  projects,
+  loading = false,
+  onOpenProject,
+  onInstallCli,
+  installingCli = false,
+}: DashboardOverviewProps) {
   const qc = useQueryClient();
   const loadFunctions = useServerFn(listFunctions);
   const checkHealth = useServerFn(checkProjectHealth);
@@ -133,10 +142,23 @@ export function DashboardOverview({ projects, loading = false, onOpenProject }: 
               </p>
             </div>
 
-            <Button variant="outline" size="sm" className="gap-2 shrink-0" onClick={refreshAll}>
-              <RefreshCw className="w-3.5 h-3.5" />
-              Actualizar
-            </Button>
+            <div className="flex items-center gap-2 shrink-0">
+              <Button
+                variant="outline"
+                size="sm"
+                className="gap-2"
+                onClick={onInstallCli}
+                disabled={installingCli}
+                title="Descarga un instalador para el CLI local"
+              >
+                {installingCli ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Download className="w-3.5 h-3.5" />}
+                Instalar CLI
+              </Button>
+              <Button variant="outline" size="sm" className="gap-2" onClick={refreshAll}>
+                <RefreshCw className="w-3.5 h-3.5" />
+                Actualizar
+              </Button>
+            </div>
           </div>
 
           <div className="mt-6 grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
