@@ -33,6 +33,7 @@ import { listSecrets, upsertSecret, deleteSecret } from "@/lib/api/secrets.funct
 import { listTokens, upsertToken, deleteToken } from "@/lib/api/tokens.functions";
 import { listDeployments, deployProject } from "@/lib/api/deployments.functions";
 import { HealthBadge } from "@/components/HealthBadge";
+import { DashboardOverview } from "@/components/DashboardOverview";
 import { invokeFunction } from "@/lib/api/invoke.functions";
 import { validateFunction } from "@/lib/api/validate.functions";
 import { aiAssist } from "@/lib/api/ai.functions";
@@ -110,10 +111,6 @@ function Dashboard() {
     staleTime: 5_000,
   });
 
-  useEffect(() => {
-    if (!projectId && projects.data?.[0]) setProjectId(projects.data[0].id);
-  }, [projects.data, projectId]);
-
   const currentProject = projects.data?.find((p) => p.id === projectId) ?? null;
 
   return (
@@ -121,8 +118,15 @@ function Dashboard() {
       {/* Sidebar */}
       <aside className="w-64 border-r border-border bg-sidebar flex flex-col">
         <div className="h-14 border-b border-border px-4 flex items-center gap-2">
-          <VortexLogo size={28} />
-          <span className="font-display font-bold text-gradient">Vortex</span>
+          <button
+            type="button"
+            onClick={() => { setProjectId(null); setFunctionId(null); setActiveFile("index.ts"); }}
+            className="flex items-center gap-2 min-w-0"
+            title="Volver al dashboard"
+          >
+            <VortexLogo size={28} />
+            <span className="font-display font-bold text-gradient">Vortex</span>
+          </button>
           <Badge variant="outline" className="ml-auto text-[10px] font-mono px-1.5 py-0">ACA</Badge>
         </div>
 
@@ -186,12 +190,24 @@ function Dashboard() {
             setFunctionId={(id) => { setFunctionId(id); setActiveFile("index.ts"); }}
             activeFile={activeFile}
             setActiveFile={setActiveFile}
-            onProjectDeleted={() => { setProjectId(null); qc.invalidateQueries({ queryKey: ["projects"] }); }}
+            onProjectDeleted={() => {
+              setProjectId(null);
+              setFunctionId(null);
+              setActiveFile("index.ts");
+              qc.invalidateQueries({ queryKey: ["projects"] });
+              qc.invalidateQueries({ queryKey: ["dashboard"] });
+            }}
           />
         ) : (
-          <div className="flex-1 flex items-center justify-center text-muted-foreground">
-            Selecciona o crea un proyecto.
-          </div>
+          <DashboardOverview
+            projects={projects.data ?? []}
+            loading={projects.isLoading}
+            onOpenProject={(id) => {
+              setProjectId(id);
+              setFunctionId(null);
+              setActiveFile("index.ts");
+            }}
+          />
         )}
       </main>
     </div>
@@ -209,6 +225,7 @@ function NewProjectDialog({ onCreated }: { onCreated: (id: string) => void }) {
     onSuccess: (p) => {
       toast.success("Proyecto creado");
       qc.invalidateQueries({ queryKey: ["projects"] });
+      qc.invalidateQueries({ queryKey: ["dashboard"] });
       onCreated(p.id);
       setOpen(false); setName(""); setRuntime("deno");
     },
@@ -298,6 +315,7 @@ function ProjectView({
     onSuccess: (f: any) => {
       toast.success("Función creada");
       qc.invalidateQueries({ queryKey: ["fns", projectId] });
+      qc.invalidateQueries({ queryKey: ["dashboard"] });
       setFunctionId(f.id);
       setNewFnOpen(false); setNewFnName("");
     },
@@ -418,12 +436,13 @@ function ProjectView({
           activeFile={activeFile}
           setActiveFile={setActiveFile}
           onDeleteFunction={async (id) => {
-            if (!confirm("¿Borrar función?")) return;
-            await df({ data: { id } });
-            qc.invalidateQueries({ queryKey: ["fns", projectId] });
-            if (functionId === id) setFunctionId(null);
-            toast.success("Función borrada");
-          }}
+          if (!confirm("¿Borrar función?")) return;
+          await df({ data: { id } });
+          qc.invalidateQueries({ queryKey: ["fns", projectId] });
+          qc.invalidateQueries({ queryKey: ["dashboard"] });
+          if (functionId === id) setFunctionId(null);
+          toast.success("Función borrada");
+        }}
         />
       ) : (
         <div className="flex-1 flex items-center justify-center text-muted-foreground text-sm">
@@ -1123,6 +1142,7 @@ function FunctionView({
       toast.success(`${hasDeployments ? "Redeploy" : "Deploy"} completado v${r.version}`);
       qc.invalidateQueries({ queryKey: ["deps", projectId] });
       qc.invalidateQueries({ queryKey: ["fns", projectId] });
+      qc.invalidateQueries({ queryKey: ["dashboard"] });
     },
     onError: (e) => toast.error(e instanceof Error ? e.message : "Error de deploy"),
   });
