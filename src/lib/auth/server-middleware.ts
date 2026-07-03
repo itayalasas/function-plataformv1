@@ -32,6 +32,21 @@ function decodeJwt(token: string): AuthSystemClaims | null {
   }
 }
 
+export function getAuthSystemClaimsFromRequest(
+  request: Request | null | undefined,
+): AuthSystemClaims | null {
+  const authHeader = request?.headers.get("authorization");
+  if (!authHeader?.startsWith("Bearer ")) return null;
+
+  const token = authHeader.slice(7).trim();
+  if (!token) return null;
+
+  const claims = decodeJwt(token);
+  if (!claims?.sub) return null;
+  if (typeof claims.exp === "number" && claims.exp * 1000 < Date.now()) return null;
+  return claims;
+}
+
 export const requireAuthSystemAuth = createMiddleware({ type: "function" }).server(
   async ({ next }) => {
     const request = getRequest();

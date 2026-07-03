@@ -7,6 +7,7 @@ import {
   Zap, Plus, Trash2, Rocket, FileCode, Lock, Activity,
   Play, Loader2, LogOut, FolderOpen, RefreshCw, ExternalLink, Eye, EyeOff,
   CheckCircle2, XCircle, Sparkles, Wand2, Copy, Globe, ArrowLeft, Pencil, FolderPlus,
+  Download,
 } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
@@ -23,6 +24,7 @@ import { Badge } from "@/components/ui/badge";
 import { ScrollArea } from "@/components/ui/scroll-area";
 
 import { useAuth } from "@/hooks/use-auth";
+import { getAccessToken } from "@/lib/auth/auth-system";
 import { listProjects, createProject, deleteProject } from "@/lib/api/projects.functions";
 import { listFunctions, createFunction, deleteFunction } from "@/lib/api/functions.functions";
 import { listFiles, upsertFile, createDirectory, deleteFile, renameFile } from "@/lib/api/files.functions";
@@ -51,6 +53,34 @@ function parentPath(path: string): string {
 
 function normalizeValidationText(input: string): string {
   return input.normalize("NFKD").replace(/[\u0300-\u036f]/g, "").toLowerCase();
+}
+
+function filenameFromContentDisposition(header: string | null): string | null {
+  if (!header) return null;
+
+  const utf8Match = header.match(/filename\*=UTF-8''([^;]+)/i);
+  if (utf8Match?.[1]) {
+    try {
+      return decodeURIComponent(utf8Match[1]);
+    } catch {
+      return utf8Match[1];
+    }
+  }
+
+  const fallbackMatch = header.match(/filename="?([^"]+)"?/i);
+  return fallbackMatch?.[1] ?? null;
+}
+
+function triggerDownload(blob: Blob, filename: string): void {
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = filename;
+  link.rel = "noopener";
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  window.setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 
 function Dashboard() {
@@ -150,6 +180,7 @@ function Dashboard() {
         {projectId ? (
           <ProjectView
             projectId={projectId}
+            projectSlug={currentProject?.slug ?? "project"}
             projectRuntime={currentProject?.runtime ?? "deno"}
             functionId={functionId}
             setFunctionId={(id) => { setFunctionId(id); setActiveFile("index.ts"); }}
@@ -236,9 +267,10 @@ function NewProjectDialog({ onCreated }: { onCreated: (id: string) => void }) {
 }
 
 function ProjectView({
-  projectId, projectRuntime, functionId, setFunctionId, activeFile, setActiveFile, onProjectDeleted,
+  projectId, projectSlug, projectRuntime, functionId, setFunctionId, activeFile, setActiveFile, onProjectDeleted,
 }: {
   projectId: string;
+  projectSlug: string;
   projectRuntime: string;
   functionId: string | null;
   setFunctionId: (id: string | null) => void;
@@ -252,6 +284,7 @@ function ProjectView({
   const df = useServerFn(deleteFunction);
   const dp = useServerFn(deleteProject);
   const runtime = getRuntimeConfig(projectRuntime);
+  const [exporting, setExporting] = useState(false);
 
   const fns = useQuery({ queryKey: ["fns", projectId], queryFn: () => lf({ data: { projectId } }) });
   const canCreateFunction = runtime.id !== "java" || fns.data?.length === 0;
@@ -270,6 +303,47 @@ function ProjectView({
     },
     onError: (e) => toast.error(e instanceof Error ? e.message : "Error"),
   });
+
+  const exportProject = async () => {
+    const token = getAccessToken();
+    if (!token) {
+      toast.error("No se encontró el token de sesión. Vuelve a iniciar sesión.");
+      return;
+    }
+
+    setExporting(true);
+    try {
+      const res = await fetch(`/api/projects/${projectId}/export`, {
+        method: "GET",
+        headers: {
+          Authorization: `Bearer ${token}`,
+        },
+      });
+
+      if (!res.ok) {
+        const text = await res.text();
+        let message = text || `Error ${res.status}`;
+        try {
+          const parsed = JSON.parse(text) as { error?: string; message?: string };
+          message = parsed.error ?? parsed.message ?? message;
+        } catch {
+          // keep the raw text
+        }
+        throw new Error(message);
+      }
+
+      const blob = await res.blob();
+      const filename =
+        filenameFromContentDisposition(res.headers.get("content-disposition")) ??
+        `${projectSlug}-functions.zip`;
+      triggerDownload(blob, filename);
+      toast.success("Exportación generada");
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "No se pudo exportar el proyecto");
+    } finally {
+      setExporting(false);
+    }
+  };
 
   return (
     <>
@@ -312,6 +386,17 @@ function ProjectView({
         ) : null}
 
         <div className="ml-auto flex items-center gap-2">
+          <Button
+            size="sm"
+            variant="outline"
+            className="gap-1"
+            onClick={exportProject}
+            disabled={exporting}
+            title="Descarga un ZIP con todas las funciones del proyecto"
+          >
+            {exporting ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Download className="w-3.5 h-3.5" />}
+            Exportar ZIP
+          </Button>
           <Button size="sm" variant="ghost" className="text-destructive" onClick={async () => {
             if (!confirm("¿Borrar proyecto entero?")) return;
             await dp({ data: { id: projectId } });
