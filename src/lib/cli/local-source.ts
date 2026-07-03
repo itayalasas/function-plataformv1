@@ -74,6 +74,15 @@ function isIgnoredFile(name: string): boolean {
   return IGNORED_FILES.has(name);
 }
 
+function isInsideRootDir(rootDir: string, targetPath: string): boolean {
+  const relative = normalizeRelativePath(path.relative(rootDir, targetPath));
+  return Boolean(relative) && !relative.startsWith("..");
+}
+
+function uniquePaths(paths: string[]): string[] {
+  return [...new Set(paths.filter(Boolean))];
+}
+
 function isBundleRootManifests(fileNames: Set<string>): boolean {
   const manifests = [
     "package.json",
@@ -171,6 +180,7 @@ function extractModuleSpecifiers(source: string): string[] {
     /\bimport\s+(?:type\s+)?(?:[^"'`]*?\s+from\s+)?["']([^"'`]+)["']/g,
     /\bexport\s+(?:\*|\{[^}]*\})\s+from\s+["']([^"'`]+)["']/g,
     /\brequire\(\s*["']([^"'`]+)["']\s*\)/g,
+    /\bimport\(\s*["']([^"'`]+)["']\s*\)/g,
   ];
 
   for (const pattern of patterns) {
@@ -181,6 +191,63 @@ function extractModuleSpecifiers(source: string): string[] {
   }
 
   return [...specifiers];
+}
+
+function extractPythonModuleSpecifiers(source: string): string[] {
+  const specifiers = new Set<string>();
+
+  for (const match of source.matchAll(/^\s*from\s+([.\w]+)\s+import\s+/gm)) {
+    const spec = match[1]?.trim();
+    if (spec) specifiers.add(spec);
+  }
+
+  for (const match of source.matchAll(/^\s*import\s+(.+)$/gm)) {
+    const clause = match[1]?.trim();
+    if (!clause) continue;
+    for (const segment of clause.split(",")) {
+      const spec = segment.replace(/\s+as\s+.+$/i, "").trim();
+      if (spec) specifiers.add(spec);
+    }
+  }
+
+  return [...specifiers];
+}
+
+function extractJavaModuleSpecifiers(source: string): string[] {
+  const specifiers = new Set<string>();
+  for (const match of source.matchAll(/^\s*import\s+(?:static\s+)?([A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$*]*)*)\s*;/gm)) {
+    const spec = match[1]?.trim();
+    if (spec) specifiers.add(spec);
+  }
+  return [...specifiers];
+}
+
+function extractDotnetModuleSpecifiers(source: string): string[] {
+  const specifiers = new Set<string>();
+  for (const match of source.matchAll(/^\s*(?:global\s+)?using\s+(?:static\s+)?([A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*)\s*;/gm)) {
+    const spec = match[1]?.trim();
+    if (spec) specifiers.add(spec);
+  }
+  return [...specifiers];
+}
+
+function extractSharedReferences(runtimeId: string, source: string): string[] {
+  const specifiers = (() => {
+    switch (runtimeId) {
+      case "python":
+        return extractPythonModuleSpecifiers(source);
+      case "java":
+        return extractJavaModuleSpecifiers(source);
+      case "dotnet":
+        return extractDotnetModuleSpecifiers(source);
+      case "node":
+      case "deno":
+      default:
+        return extractModuleSpecifiers(source);
+    }
+  })();
+
+  return specifiers.filter((specifier) => specifier.includes("_shared"));
 }
 
 function sharedRootFromAbsolutePath(absPath: string): string | null {
@@ -213,55 +280,90 @@ function toRelativeImportPath(fromDir: string, toPath: string): string {
   return rel.startsWith(".") ? rel : `./${rel}`;
 }
 
-async function resolveSharedSourceRoot(rootDir: string, entrypointPath: string, source: string): Promise<string | null> {
+function sharedBundleRootRelative(runtimeId: string, rootDir: string, sharedSourceRoot: string): string {
+  const relative = normalizeRelativePath(path.relative(rootDir, sharedSourceRoot));
+  if (runtimeId === "java") {
+    if (relative && !relative.startsWith("..") && relative.startsWith("src/main/java/")) {
+      return relative;
+    }
+    return "src/main/java/_shared";
+  }
+
+  if (relative && !relative.startsWith("..")) {
+    return relative;
+  }
+
+  return "_shared";
+}
+
+function sharedRootCandidates(runtimeId: string, rootDir: string, entrypointPath: string): string[] {
   const entrypointDir = path.dirname(path.join(rootDir, entrypointPath));
-  const sharedImports = extractModuleSpecifiers(source).filter(
-    (spec) => spec.startsWith(".") && spec.includes("_shared"),
-  );
+  const candidates = [
+    path.join(entrypointDir, "_shared"),
+    ...(runtimeId === "java" ? [path.join(rootDir, "src/main/java/_shared")] : []),
+    path.join(rootDir, "_shared"),
+    path.join(path.dirname(rootDir), "_shared"),
+  ];
 
-  if (sharedImports.length === 0) return null;
+  return uniquePaths(candidates.map((candidate) => path.normalize(candidate)));
+}
 
-  const localSharedRoot = path.join(rootDir, "_shared");
-  if (await pathExists(localSharedRoot)) {
-    return localSharedRoot;
+async function resolveSharedSourceRoot(
+  runtimeId: string,
+  rootDir: string,
+  entrypointPath: string,
+  source: string,
+): Promise<string | null> {
+  const sharedReferences = extractSharedReferences(runtimeId, source);
+  if (sharedReferences.length === 0) return null;
+
+  const entrypointDir = path.dirname(path.join(rootDir, entrypointPath));
+
+  if (runtimeId === "node" || runtimeId === "deno") {
+    const resolvedRoots: string[] = [];
+    for (const spec of sharedReferences) {
+      if (!spec.startsWith(".") && !spec.startsWith("/")) continue;
+      const resolved = path.resolve(entrypointDir, spec);
+      const sharedRoot = sharedRootFromAbsolutePath(resolved);
+      if (!sharedRoot) continue;
+      if (!(await pathExists(sharedRoot))) continue;
+      resolvedRoots.push(sharedRoot);
+    }
+
+    const uniqueResolvedRoots = uniquePaths(resolvedRoots.map((candidate) => path.normalize(candidate)));
+    if (uniqueResolvedRoots.length > 1) {
+      throw new Error(
+        `El index ${path.join(rootDir, entrypointPath)} referencia mas de un directorio _shared. Deja un solo _shared por function.`,
+      );
+    }
+
+    if (uniqueResolvedRoots.length === 1) {
+      return uniqueResolvedRoots[0] ?? null;
+    }
   }
 
-  const parentSharedRoot = path.join(path.dirname(rootDir), "_shared");
-  if (await pathExists(parentSharedRoot)) {
-    return parentSharedRoot;
+  for (const candidate of sharedRootCandidates(runtimeId, rootDir, entrypointPath)) {
+    if (await pathExists(candidate)) {
+      return candidate;
+    }
   }
 
-  const resolvedRoots = new Set<string>();
-  for (const spec of sharedImports) {
-    const resolved = path.resolve(entrypointDir, spec);
-    const sharedRoot = sharedRootFromAbsolutePath(resolved);
-    if (!sharedRoot) continue;
-    if (!(await pathExists(sharedRoot))) continue;
-    resolvedRoots.add(sharedRoot);
-  }
-
-  if (resolvedRoots.size === 0) return null;
-  if (resolvedRoots.size > 1) {
-    throw new Error(
-      `El index ${path.join(rootDir, entrypointPath)} referencia mas de un directorio _shared. Deja un solo _shared por function.`,
-    );
-  }
-
-  return [...resolvedRoots][0] ?? null;
+  return null;
 }
 
 function rewriteSharedImports(
   source: string,
   entrypointDir: string,
   bundleRoot: string,
+  sharedBundleRootRelative: string,
 ): string {
   return source.replace(
-    /(\b(?:import\s+(?:type\s+)?(?:[^"'`]*?\s+from\s+)?|export\s+(?:\*|\{[^}]*\}\s+from\s+)|require\()\s*["'])([^"'`]+)(["'])/g,
+    /(\b(?:import\s+(?:type\s+)?(?:[^"'`]*?\s+from\s+)?|export\s+(?:\*|\{[^}]*\}\s+from\s+)|require\(|import\()\s*["'])([^"'`]+)(["'])/g,
     (full, prefix: string, spec: string, suffix: string) => {
       if (!spec.startsWith(".") || !spec.includes("_shared")) return full;
       const replacement = toRelativeImportPath(
         entrypointDir,
-        path.join(bundleRoot, "_shared", sharedTailFromSpecifier(spec)),
+        path.join(bundleRoot, sharedBundleRootRelative, sharedTailFromSpecifier(spec)),
       );
       return `${prefix}${replacement}${suffix}`;
     },
@@ -372,24 +474,27 @@ async function buildBundleFromRoot(rootDir: string, runtimeId: string): Promise<
   );
   if (entrypointIndex >= 0) {
     const entrypointSource = entries[entrypointIndex].content;
-    const sharedImports = extractModuleSpecifiers(entrypointSource).filter(
-      (spec) => spec.startsWith(".") && spec.includes("_shared"),
-    );
-    const sharedSourceRoot = await resolveSharedSourceRoot(rootDir, entrypoint, entrypointSource);
-    if (sharedImports.length > 0 && !sharedSourceRoot) {
+    const sharedReferences = extractSharedReferences(runtimeId, entrypointSource);
+    const sharedSourceRoot = await resolveSharedSourceRoot(runtimeId, rootDir, entrypoint, entrypointSource);
+    if (sharedReferences.length > 0 && !sharedSourceRoot) {
       throw new Error(
         `El index ${path.join(rootDir, entrypoint)} importa _shared pero no encontré una carpeta compartida correspondiente.`,
       );
     }
 
     if (sharedSourceRoot) {
-      for (const spec of sharedImports) {
-        const sharedTail = sharedTailFromSpecifier(spec);
-        const expectedPath = path.join(sharedSourceRoot, sharedTail);
-        if (!(await pathExists(expectedPath))) {
-          throw new Error(
-            `El index ${path.join(rootDir, entrypoint)} importa "${spec}" pero no existe dentro de ${sharedSourceRoot}.`,
-          );
+      const bundleSharedRootRelative = sharedBundleRootRelative(runtimeId, rootDir, sharedSourceRoot);
+
+      if (runtimeId === "node" || runtimeId === "deno") {
+        for (const spec of sharedReferences) {
+          if (!spec.startsWith(".") && !spec.startsWith("/")) continue;
+          const sharedTail = sharedTailFromSpecifier(spec);
+          const expectedPath = path.join(sharedSourceRoot, sharedTail);
+          if (!(await pathExists(expectedPath))) {
+            throw new Error(
+              `El index ${path.join(rootDir, entrypoint)} importa "${spec}" pero no existe dentro de ${sharedSourceRoot}.`,
+            );
+          }
         }
       }
 
@@ -399,14 +504,17 @@ async function buildBundleFromRoot(rootDir: string, runtimeId: string): Promise<
         bundleEntries.set(entry.path, entry);
       }
       for (const sharedEntry of sharedEntries) {
-        const bundlePath = normalizeRelativePath(path.posix.join("_shared", sharedEntry.path));
+        const bundlePath = normalizeRelativePath(path.posix.join(bundleSharedRootRelative, sharedEntry.path));
         bundleEntries.set(bundlePath, { ...sharedEntry, path: bundlePath });
       }
 
       const entrypointDir = path.dirname(path.join(rootDir, entrypoint));
       const rewrittenEntry = {
         ...entries[entrypointIndex],
-        content: rewriteSharedImports(entrypointSource, entrypointDir, rootDir),
+        content:
+          runtimeId === "node" || runtimeId === "deno"
+            ? rewriteSharedImports(entrypointSource, entrypointDir, rootDir, bundleSharedRootRelative)
+            : entrypointSource,
       };
       bundleEntries.set(rewrittenEntry.path, rewrittenEntry);
 

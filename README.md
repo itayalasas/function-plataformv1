@@ -90,9 +90,12 @@ functions/
 ```
 
 The CLI only includes `_shared` when the function entrypoint imports it.
+It understands the common import styles for Node/TypeScript, Python, Java,
+and .NET.
 If the function already has its own `_shared` folder, that version is used.
 If not, the CLI can source a shared `_shared` folder from the project tree
-and materialize it inside the function bundle.
+and materialize it inside the function bundle at the path each runtime
+expects (`_shared` for Node/Python/.NET, `src/main/java/_shared` for Java).
 
 If a function needs a custom entrypoint, add a `vortex.json` file inside that
 function folder:
