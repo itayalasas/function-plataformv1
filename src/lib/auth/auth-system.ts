@@ -2,7 +2,7 @@
 // builds login/register redirect URLs, and exchanges auth codes for tokens.
 
 const ENV_ENDPOINT = "https://ffihaeatoundrjzgtpzk.supabase.co/functions/v1/get-env";
-const ENV_ACCESS_KEY = "bc9a5e80deaef461272edce804d93fc81a14e7bf9fcf91f516bf2f9a8676f793";
+const ENV_ACCESS_KEY = "d61ec0701398f9f7c148c39f3f8c2ac21aabb83dfa8362c7b69e411191d37227";
 
 const STORAGE_KEYS = {
   config: "authsystem:config",
