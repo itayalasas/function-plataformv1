@@ -7,7 +7,7 @@ import {
   Zap, Plus, Trash2, Rocket, FileCode, Lock, Activity,
   Play, Loader2, LogOut, FolderOpen, RefreshCw, ExternalLink, Eye, EyeOff,
   CheckCircle2, XCircle, Sparkles, Wand2, Copy, Globe, ArrowLeft, Pencil, FolderPlus,
-  Download,
+  Download, ArrowLeftRight,
 } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
@@ -42,6 +42,7 @@ import { listTokens, upsertToken, deleteToken } from "@/lib/api/tokens.functions
 import { listDeployments, deployProject } from "@/lib/api/deployments.functions";
 import { HealthBadge } from "@/components/HealthBadge";
 import { DashboardOverview } from "@/components/DashboardOverview";
+import { FunctionTransactionsPanel } from "@/components/FunctionTransactionsPanel";
 import { invokeFunction } from "@/lib/api/invoke.functions";
 import { validateFunction } from "@/lib/api/validate.functions";
 import { aiAssist } from "@/lib/api/ai.functions";
@@ -748,7 +749,7 @@ function FunctionDetail({
   onBack: () => void;
   onDelete: () => void;
 }) {
-  const [tab, setTab] = useState<"overview" | "logs" | "code" | "tokens" | "secrets" | "deploys">("code");
+  const [tab, setTab] = useState<"overview" | "transactions" | "logs" | "code" | "tokens" | "secrets" | "deploys">("code");
   const runtime = getRuntimeConfig(projectRuntime);
   const url = current?.fqdn
     ? runtime.multiFunction
@@ -799,7 +800,8 @@ function FunctionDetail({
       <div className="px-6 border-b border-border flex items-center gap-1 shrink-0">
         {([
           { id: "overview", label: "Overview", icon: FolderOpen },
-          { id: "logs", label: "Logs", icon: Activity },
+          { id: "transactions", label: "Transactions", icon: ArrowLeftRight },
+          { id: "logs", label: "System Logs", icon: Activity },
           { id: "code", label: "Code", icon: FileCode },
           { id: "tokens", label: "Tokens", icon: Lock },
           { id: "secrets", label: "Secrets", icon: Lock },
@@ -828,6 +830,7 @@ function FunctionDetail({
         {tab === "overview" && (
           <OverviewPanel projectId={projectId} current={current} url={url} onGoCode={() => setTab("code")} />
         )}
+        {tab === "transactions" && <FunctionTransactionsPanel functionId={functionId} />}
         {/* Keep Code mounted across tab changes so unsaved draft is preserved */}
         <div className={tab === "code" ? "contents" : "hidden"}>
           <FunctionView

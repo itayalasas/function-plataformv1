@@ -125,7 +125,7 @@ export const listLogs = createServerFn({ method: "GET" })
         FROM invocation_logs
         WHERE function_id = ${data.functionId} AND owner_id = ${context.userId}
         ORDER BY created_at DESC
-        LIMIT 50
+        LIMIT 200
       `;
     return rows as Array<{
       id: string;
