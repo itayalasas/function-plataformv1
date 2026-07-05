@@ -1,8 +1,20 @@
+import fs from "node:fs/promises";
+import type { Dirent } from "node:fs";
+import path from "node:path";
+
 import { neon, type NeonQueryFunction } from "@neondatabase/serverless";
 
 let _sql: NeonQueryFunction<false, false> | undefined;
 let _schemaReady: Promise<void> | undefined;
 let _warnedAboutPooledUrl = false;
+
+type DiskMigration = {
+  id: string;
+  statements: string[];
+};
+
+const MIGRATIONS_TABLE = "neon_schema_migrations";
+const NEON_MIGRATIONS_DIR = path.resolve(process.cwd(), "neon", "migrations");
 
 function derivePooledNeonUrl(rawUrl: string): string {
   try {
@@ -44,122 +56,69 @@ export function sql(): NeonQueryFunction<false, false> {
   return _sql;
 }
 
-const SCHEMA = `
-CREATE EXTENSION IF NOT EXISTS "pgcrypto";
+function splitSqlStatements(sqlText: string): string[] {
+  return sqlText
+    .split(/;\s*(?:\r?\n|$)/g)
+    .map((statement) => statement.trim())
+    .filter(Boolean);
+}
 
-CREATE TABLE IF NOT EXISTS projects (
-  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-  owner_id text NOT NULL,
-  name text NOT NULL,
-  slug text NOT NULL,
-  container_app_name text,
-  fqdn text,
-  admin_token text,
-  last_deployed_at timestamptz,
-  created_at timestamptz NOT NULL DEFAULT now(),
-  UNIQUE (owner_id, slug)
-);
-CREATE INDEX IF NOT EXISTS idx_projects_owner ON projects(owner_id);
-ALTER TABLE projects ADD COLUMN IF NOT EXISTS container_app_name text;
-ALTER TABLE projects ADD COLUMN IF NOT EXISTS fqdn text;
-ALTER TABLE projects ADD COLUMN IF NOT EXISTS admin_token text;
-ALTER TABLE projects ADD COLUMN IF NOT EXISTS last_deployed_at timestamptz;
-ALTER TABLE projects ADD COLUMN IF NOT EXISTS runtime text NOT NULL DEFAULT 'deno';
+async function ensureMigrationTable(s: NeonQueryFunction<false, false>): Promise<void> {
+  await s.query(`
+    CREATE TABLE IF NOT EXISTS ${MIGRATIONS_TABLE} (
+      id text PRIMARY KEY,
+      applied_at timestamptz NOT NULL DEFAULT now()
+    )
+  `);
+}
 
+async function readMigrationsFromDisk(): Promise<DiskMigration[]> {
+  let entries: Dirent[];
+  try {
+    entries = await fs.readdir(NEON_MIGRATIONS_DIR, { withFileTypes: true });
+  } catch (error) {
+    throw new Error(`Neon migrations directory not found: ${NEON_MIGRATIONS_DIR}`);
+  }
 
-CREATE TABLE IF NOT EXISTS functions (
-  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-  project_id uuid NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
-  owner_id text NOT NULL,
-  name text NOT NULL,
-  slug text NOT NULL,
-  entrypoint text NOT NULL DEFAULT 'index.ts',
-  status text NOT NULL DEFAULT 'draft',
-  current_deployment_id uuid,
-  container_app_name text,
-  fqdn text,
-  created_at timestamptz NOT NULL DEFAULT now(),
-  updated_at timestamptz NOT NULL DEFAULT now(),
-  UNIQUE (project_id, slug)
-);
-CREATE INDEX IF NOT EXISTS idx_functions_project ON functions(project_id);
+  const files = entries
+    .filter((entry) => entry.isFile() && entry.name.toLowerCase().endsWith(".sql"))
+    .map((entry) => entry.name)
+    .sort((a, b) => a.localeCompare(b, "en"));
 
-CREATE TABLE IF NOT EXISTS function_files (
-  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-  function_id uuid NOT NULL REFERENCES functions(id) ON DELETE CASCADE,
-  owner_id text NOT NULL,
-  path text NOT NULL,
-  kind text NOT NULL DEFAULT 'file',
-  content text NOT NULL DEFAULT '',
-  updated_at timestamptz NOT NULL DEFAULT now(),
-  UNIQUE (function_id, path)
-);
-CREATE INDEX IF NOT EXISTS idx_files_fn ON function_files(function_id);
-ALTER TABLE function_files ADD COLUMN IF NOT EXISTS kind text NOT NULL DEFAULT 'file';
+  if (!files.length) {
+    throw new Error(`No SQL migrations found in ${NEON_MIGRATIONS_DIR}`);
+  }
 
-CREATE TABLE IF NOT EXISTS secrets (
-  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-  project_id uuid NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
-  owner_id text NOT NULL,
-  name text NOT NULL,
-  value text NOT NULL,
-  updated_at timestamptz NOT NULL DEFAULT now(),
-  UNIQUE (project_id, name)
-);
+  return Promise.all(
+    files.map(async (fileName) => {
+      const filePath = path.join(NEON_MIGRATIONS_DIR, fileName);
+      const raw = await fs.readFile(filePath, "utf8");
+      return {
+        id: path.basename(fileName, ".sql"),
+        statements: splitSqlStatements(raw),
+      };
+    }),
+  );
+}
 
-CREATE TABLE IF NOT EXISTS function_tokens (
-  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-  function_id uuid NOT NULL REFERENCES functions(id) ON DELETE CASCADE,
-  owner_id text NOT NULL,
-  name text NOT NULL,
-  value text NOT NULL,
-  updated_at timestamptz NOT NULL DEFAULT now(),
-  UNIQUE (function_id, name)
-);
-CREATE INDEX IF NOT EXISTS idx_tokens_fn ON function_tokens(function_id);
+async function getAppliedMigrations(s: NeonQueryFunction<false, false>): Promise<Set<string>> {
+  const rows = (await s.query(`SELECT id FROM ${MIGRATIONS_TABLE} ORDER BY applied_at ASC`)) as Array<{
+    id: string;
+  }>;
+  return new Set(rows.map((row) => row.id));
+}
 
-CREATE TABLE IF NOT EXISTS deployments (
-  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-  function_id uuid REFERENCES functions(id) ON DELETE CASCADE,
-  project_id uuid REFERENCES projects(id) ON DELETE CASCADE,
-  owner_id text NOT NULL,
-  version int NOT NULL,
-  container_app_name text NOT NULL,
-  fqdn text,
-  status text NOT NULL DEFAULT 'provisioning',
-  error text,
-  created_at timestamptz NOT NULL DEFAULT now()
-);
-ALTER TABLE deployments ADD COLUMN IF NOT EXISTS project_id uuid REFERENCES projects(id) ON DELETE CASCADE;
-ALTER TABLE deployments ADD COLUMN IF NOT EXISTS runtime text;
-ALTER TABLE deployments ALTER COLUMN function_id DROP NOT NULL;
-CREATE INDEX IF NOT EXISTS idx_deployments_project ON deployments(project_id);
-
-CREATE TABLE IF NOT EXISTS invocation_logs (
-  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-  function_id uuid NOT NULL REFERENCES functions(id) ON DELETE CASCADE,
-  owner_id text NOT NULL,
-  method text NOT NULL,
-  path text NOT NULL,
-  status int,
-  duration_ms int,
-  error text,
-  created_at timestamptz NOT NULL DEFAULT now()
-);
-CREATE INDEX IF NOT EXISTS idx_logs_fn ON invocation_logs(function_id, created_at DESC);
-
-CREATE TABLE IF NOT EXISTS system_logs (
-  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-  project_id uuid REFERENCES projects(id) ON DELETE CASCADE,
-  owner_id text NOT NULL,
-  level text NOT NULL,
-  source text NOT NULL,
-  message text NOT NULL,
-  meta jsonb,
-  created_at timestamptz NOT NULL DEFAULT now()
-);
-CREATE INDEX IF NOT EXISTS idx_syslogs_project ON system_logs(project_id, created_at DESC);
-`;
+async function applyMigration(s: NeonQueryFunction<false, false>, migration: DiskMigration): Promise<void> {
+  console.log(`[db] Applying migration ${migration.id}`);
+  for (const statement of migration.statements) {
+    await s.query(statement);
+  }
+  await s`
+    INSERT INTO neon_schema_migrations (id)
+    VALUES (${migration.id})
+    ON CONFLICT (id) DO NOTHING
+  `;
+}
 
 /** Server-side helper: append a structured log entry. Never throws. */
 export async function logEvent(
@@ -171,6 +130,7 @@ export async function logEvent(
   meta?: unknown,
 ): Promise<void> {
   try {
+    await ensureSchema();
     const s = sql();
     const metaJson = meta === undefined ? null : JSON.stringify(meta);
     await s`INSERT INTO system_logs (project_id, owner_id, level, source, message, meta)
@@ -180,15 +140,65 @@ export async function logEvent(
   }
 }
 
+export type InvocationLogPayload = {
+  projectId: string | null;
+  functionId: string;
+  ownerId: string;
+  kind?: string;
+  method: string;
+  path: string;
+  target?: string | null;
+  status?: number | null;
+  durationMs?: number | null;
+  error?: string | null;
+  request?: unknown;
+  response?: unknown;
+  meta?: unknown;
+};
+
+/** Server-side helper: append a structured function/API invocation log. Never throws. */
+export async function recordInvocationLog(payload: InvocationLogPayload): Promise<void> {
+  try {
+    await ensureSchema();
+    const s = sql();
+    const requestJson = payload.request === undefined ? null : JSON.stringify(payload.request);
+    const responseJson = payload.response === undefined ? null : JSON.stringify(payload.response);
+    const metaJson = payload.meta === undefined ? null : JSON.stringify(payload.meta);
+    await s`
+      INSERT INTO invocation_logs (
+        project_id, function_id, owner_id, kind, method, path, target, status, duration_ms, error, request, response, meta
+      ) VALUES (
+        ${payload.projectId},
+        ${payload.functionId},
+        ${payload.ownerId},
+        ${payload.kind ?? "manual"},
+        ${payload.method},
+        ${payload.path},
+        ${payload.target ?? null},
+        ${payload.status ?? null},
+        ${payload.durationMs ?? null},
+        ${payload.error ?? null},
+        ${requestJson}::jsonb,
+        ${responseJson}::jsonb,
+        ${metaJson}::jsonb
+      )
+    `;
+  } catch (e) {
+    console.error("[recordInvocationLog] failed", e);
+  }
+}
+
 export function ensureSchema(): Promise<void> {
   if (!_schemaReady) {
     const s = sql();
     _schemaReady = (async () => {
-      // Neon HTTP requires single statement per query — split by ';'
-      for (const stmt of SCHEMA.split(/;\s*\n/)
-        .map((x) => x.trim())
-        .filter(Boolean)) {
-        await s.query(stmt);
+      await ensureMigrationTable(s);
+      const applied = await getAppliedMigrations(s);
+      const migrations = await readMigrationsFromDisk();
+      for (const migration of migrations) {
+        if (applied.has(migration.id)) continue;
+        await applyMigration(s, migration);
+        applied.add(migration.id);
       }
     })().catch((err) => {
       _schemaReady = undefined;

@@ -4,6 +4,7 @@ import { RUNNER_SOURCE } from "../runner-source.generated.ts";
 import { getRuntimeConfig, type RuntimeId } from "../runtimes/index.ts";
 import { NODE_RUNNER_SOURCE } from "../runtimes/runner-node.ts";
 import { PYTHON_RUNNER_SOURCE } from "../runtimes/runner-python.ts";
+import { getRequest } from "@tanstack/react-start/server";
 
 export type DeployProgressLogger = (
   level: "info" | "warn" | "error",
@@ -11,10 +12,204 @@ export type DeployProgressLogger = (
   meta?: Record<string, unknown>,
 ) => void;
 
+function normalizeBaseUrl(input: string | null | undefined): string | null {
+  const raw = input?.trim();
+  if (!raw) return null;
+  try {
+    const parsed = new URL(raw);
+    const host = parsed.hostname.toLowerCase();
+    if (
+      host === "localhost" ||
+      host === "127.0.0.1" ||
+      host === "::1" ||
+      host === "0.0.0.0" ||
+      host.endsWith(".local")
+    ) {
+      return null;
+    }
+    return parsed.origin;
+  } catch {
+    return null;
+  }
+}
+
+function resolvePlatformBaseUrl(override?: string | null): string | null {
+  const candidates = [
+    override,
+    process.env.VORTEX_PUBLIC_BASE_URL,
+    process.env.FUNCTIONS_BASE_URL,
+    process.env.PUBLIC_BASE_URL,
+    process.env.APP_BASE_URL,
+    process.env.SITE_URL,
+  ];
+  for (const candidate of candidates) {
+    const normalized = normalizeBaseUrl(candidate);
+    if (normalized) return normalized;
+  }
+
+  try {
+    const request = getRequest();
+    if (request) {
+      return normalizeBaseUrl(request.headers.get("origin")) ?? normalizeBaseUrl(request.url);
+    }
+  } catch {
+    // No active request context.
+  }
+
+  return null;
+}
+
+function createRuntimeLogToken(): string {
+  return crypto.randomUUID().replace(/-/g, "") + crypto.randomUUID().replace(/-/g, "");
+}
+
+function buildLoggedDenoRunnerSource(source: string): string {
+  if (source.includes("const LOG_INGEST_URL = Deno.env.get(\"VORTEX_LOG_INGEST_URL\") ?? \"\";")) {
+    return source;
+  }
+
+  const helperBlock = [
+    'const LOG_INGEST_URL = Deno.env.get("VORTEX_LOG_INGEST_URL") ?? "";',
+    'const LOG_TOKEN = Deno.env.get("VORTEX_LOG_TOKEN") ?? "";',
+    '',
+    'function redactHeaders(headers: Headers): Record<string, string> {',
+    '  const out: Record<string, string> = {};',
+    '  for (const [key, value] of headers.entries()) {',
+    '    if (/^(authorization|x-api-key|x-admin-token)$/i.test(key)) {',
+    '      out[key] = "[redacted]";',
+    '      continue;',
+    '    }',
+    '    out[key] = value;',
+    '  }',
+    '  return out;',
+    '}',
+    '',
+    'function trimLogText(value: string, limit = 8000): string {',
+    '  if (value.length <= limit) return value;',
+    '  return value.slice(0, limit) + "... [truncated " + String(value.length - limit) + " chars]";',
+    '}',
+    '',
+    'async function persistInvocationLog(entry: {',
+    '  level: "info" | "warn" | "error";',
+    '  source: string;',
+    '  message: string;',
+    '  meta: Record<string, unknown>;',
+    '}): Promise<void> {',
+    '  if (!LOG_INGEST_URL || !LOG_TOKEN) return;',
+    '  try {',
+    '    await fetch(LOG_INGEST_URL, {',
+    '      method: "POST",',
+    '      headers: {',
+    '        "content-type": "application/json",',
+    '        "x-vortex-log-token": LOG_TOKEN,',
+    '      },',
+    '      body: JSON.stringify({',
+    '        projectId: PROJECT_ID,',
+    '        token: LOG_TOKEN,',
+    '        level: entry.level,',
+    '        source: entry.source,',
+    '        message: entry.message,',
+    '        meta: entry.meta,',
+    '      }),',
+    '    });',
+    '  } catch (err) {',
+    '    console.error("[runner] failed to send runtime log:", err);',
+    '  }',
+    '}',
+  ].join("\n");
+
+  source = source.replace(
+    'const tokenEnvOriginals = new Map<string, string | undefined>();\n\nfunction tokenEnvAliases(name: string): string[] {',
+    `const tokenEnvOriginals = new Map<string, string | undefined>();\n${helperBlock}\n\nfunction tokenEnvAliases(name: string): string[] {`,
+  );
+
+  source = source.replace(
+    '  const projectSecrets = await loadProjectSecrets();\n  const tokens = await loadTokens(fn.id);\n  applyProjectSecretsEnv(projectSecrets);\n  applyTokenEnv(tokens);\n  try {\n    const res = await fn.handler(innerReq, { tokens, functionId: fn.id });\n    return withCors(res, origin);\n  } catch (err) {\n    console.error(`[runner] ${slug} threw:`, err);\n    return withCors(new Response(\n      JSON.stringify({ error: err instanceof Error ? err.message : String(err) }),\n      { status: 500, headers: { "content-type": "application/json" } },\n    ), origin);\n  }',
+    [
+      '  const startedAt = Date.now();',
+      '  const requestPath = innerUrl.pathname + innerUrl.search;',
+      '  const requestHeaders = redactHeaders(innerReq.headers);',
+      '  const requestBody = ["GET", "HEAD"].includes(innerReq.method) ? "" : await innerReq.clone().text();',
+      '  const projectSecrets = await loadProjectSecrets();',
+      '  const tokens = await loadTokens(fn.id);',
+      '  applyProjectSecretsEnv(projectSecrets);',
+      '  applyTokenEnv(tokens);',
+      '  try {',
+      '    const response = withCors(await fn.handler(innerReq, { tokens, functionId: fn.id }), origin);',
+      '    let responseBody = "";',
+      '    try {',
+      '      responseBody = trimLogText(await response.clone().text());',
+      '    } catch {',
+      '      responseBody = "[unreadable]";',
+      '    }',
+      '    const duration = Date.now() - startedAt;',
+      '    await persistInvocationLog({',
+      '      level: response.status >= 400 ? "warn" : "info",',
+      '      source: "runtime",',
+    '      message: "-> " + innerReq.method + " " + requestPath + " | <- " + response.status + " (" + duration + "ms)",',
+      '      meta: {',
+      '        runtime: "deno",',
+      '        function: slug,',
+      '        functionId: fn.id,',
+      '        request: {',
+      '          method: innerReq.method,',
+      '          path: requestPath,',
+      '          headers: requestHeaders,',
+      '          body: requestBody ? trimLogText(requestBody) : null,',
+      '          query: Object.fromEntries(innerUrl.searchParams.entries()),',
+      '        },',
+      '        response: {',
+      '          status: response.status,',
+      '          headers: redactHeaders(response.headers),',
+      '          body: responseBody,',
+      '        },',
+      '        durationMs: duration,',
+      '      },',
+      '    });',
+      '    return response;',
+      '  } catch (err) {',
+      '    const duration = Date.now() - startedAt;',
+      '    const errorMessage = err instanceof Error ? err.message : String(err);',
+      '    await persistInvocationLog({',
+      '      level: "error",',
+      '      source: "runtime",',
+    '      message: "-> " + innerReq.method + " " + requestPath + " | <- ERR (" + duration + "ms)",',
+      '      meta: {',
+      '        runtime: "deno",',
+      '        function: slug,',
+      '        functionId: fn.id,',
+      '        request: {',
+      '          method: innerReq.method,',
+      '          path: requestPath,',
+      '          headers: requestHeaders,',
+      '          body: requestBody ? trimLogText(requestBody) : null,',
+      '          query: Object.fromEntries(innerUrl.searchParams.entries()),',
+      '        },',
+      '        response: {',
+      '          status: 500,',
+      '          headers: { "content-type": "application/json" },',
+      '          body: JSON.stringify({ error: errorMessage }),',
+      '        },',
+      '        error: errorMessage,',
+      '        durationMs: duration,',
+      '      },',
+      '    });',
+      '    console.error(`[runner] ${slug} threw:`, err);',
+      '    return withCors(new Response(',
+      '      JSON.stringify({ error: errorMessage }),',
+      '      { status: 500, headers: { "content-type": "application/json" } },',
+      '    ), origin);',
+      '  }',
+    ].join("\n"),
+  );
+
+  return source;
+}
+
 function getRunnerScript(runtime: RuntimeId): string {
   switch (runtime) {
     case "deno":
-      if (RUNNER_SOURCE && RUNNER_SOURCE.length > 100) return RUNNER_SOURCE;
+      if (RUNNER_SOURCE && RUNNER_SOURCE.length > 100) return buildLoggedDenoRunnerSource(RUNNER_SOURCE);
       return "console.error('runner/main.ts missing'); Deno.exit(1);";
     case "node":
       return NODE_RUNNER_SOURCE;
@@ -45,19 +240,22 @@ export interface DeployProjectResult {
 export async function deployProjectById({
   projectId,
   ownerId,
+  platformBaseUrl,
   progress,
 }: {
   projectId: string;
   ownerId: string;
+  platformBaseUrl?: string | null;
   progress?: DeployProgressLogger;
 }): Promise<DeployProjectResult> {
   await ensureSchema();
   const s = sql();
   const projs =
-    (await s`SELECT id, slug, admin_token, runtime FROM projects WHERE id = ${projectId} AND owner_id = ${ownerId}`) as Array<{
+    (await s`SELECT id, slug, admin_token, log_token, runtime FROM projects WHERE id = ${projectId} AND owner_id = ${ownerId}`) as Array<{
       id: string;
       slug: string;
       admin_token: string | null;
+      log_token: string | null;
       runtime: string | null;
     }>;
   if (!projs[0]) throw new Error("Project not found");
@@ -75,6 +273,21 @@ export async function deployProjectById({
   if (!adminToken) {
     adminToken = crypto.randomUUID().replace(/-/g, "") + crypto.randomUUID().replace(/-/g, "");
     await s`UPDATE projects SET admin_token = ${adminToken} WHERE id = ${proj.id}`;
+  }
+
+  let logToken = proj.log_token ?? "";
+  if (!logToken) {
+    logToken = createRuntimeLogToken();
+    await s`UPDATE projects SET log_token = ${logToken} WHERE id = ${proj.id}`;
+  }
+
+  const platformOrigin = resolvePlatformBaseUrl(platformBaseUrl);
+  const runtimeLogIngestUrl = platformOrigin ? new URL("/api/runtime-logs", platformOrigin).toString() : "";
+  if (!runtimeLogIngestUrl) {
+    progress?.("warn", "Runtime logs disabled: missing platform base URL", {
+      projectId: proj.id,
+      runtime: runtimeId,
+    });
   }
 
   const secretRows =
@@ -160,11 +373,16 @@ export async function deployProjectById({
     const baseEnv: Record<string, string> = {
       NEON_URL: neonUrl,
       PROJECT_ID: proj.id,
+      VORTEX_OWNER_ID: ownerId,
       ADMIN_TOKEN: adminToken,
       DEPLOYMENT_VERSION: String(version),
       RUNTIME: runtimeId,
       PORT: String(runtime.port),
     };
+    if (runtimeLogIngestUrl) {
+      baseEnv.VORTEX_LOG_INGEST_URL = runtimeLogIngestUrl;
+    }
+    baseEnv.VORTEX_LOG_TOKEN = logToken;
     if (apiKeyValues.length) {
       baseEnv.API_KEY = apiKeyValues.join(",");
     }

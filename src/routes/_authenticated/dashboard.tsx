@@ -142,16 +142,9 @@ function Dashboard() {
   const lp = useServerFn(listProjects);
   const projects = useQuery({
     queryKey: ["projects"],
-    queryFn: async ({ signal }) => {
-      const projectsAbort = new AbortController();
-      const timeout = window.setTimeout(() => projectsAbort.abort(), 12_000);
-      signal.addEventListener("abort", () => projectsAbort.abort(), { once: true });
-      try {
-        return (await lp({ signal: projectsAbort.signal } as never)) ?? [];
-      } finally {
-        window.clearTimeout(timeout);
-      }
-    },
+    // No forwarded AbortSignal here: TanStack Start logs aborted serverFn fetches
+    // as AbortError during React Query unmount/retry cycles.
+    queryFn: () => lp({} as never),
     retry: 3,
     retryDelay: (attempt) => Math.min(800 * 2 ** attempt, 3_000),
     staleTime: 5_000,
@@ -228,7 +221,12 @@ function Dashboard() {
             {projects.isLoading && <div className="text-xs text-muted-foreground px-2 py-1">Cargando…</div>}
             {projects.isError && (
               <div className="px-2 py-2 space-y-2">
-                <div className="text-xs text-destructive">No se pudieron cargar los proyectos.</div>
+                <div className="text-xs text-destructive">
+                  No se pudieron cargar los proyectos.
+                  <div className="mt-1 text-[11px] text-muted-foreground normal-case">
+                    {projects.error instanceof Error ? projects.error.message : String(projects.error)}
+                  </div>
+                </div>
                 <Button size="sm" variant="outline" className="h-7 text-xs" onClick={() => projects.refetch()}>
                   <RefreshCw className="w-3 h-3" /> Reintentar
                 </Button>

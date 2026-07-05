@@ -35,17 +35,43 @@ async function getProjectContainerApp(projectId: string, ownerId: string) {
 export const listProjects = createServerFn({ method: "GET" })
   .middleware([requireAuthSystemAuth])
   .handler(async ({ context }) => {
-    await ensureSchema();
-    const s = sql();
-    const rows =
-      await s`SELECT id, name, slug, runtime, created_at FROM projects WHERE owner_id = ${context.userId} ORDER BY created_at DESC`;
-    return rows as {
-      id: string;
-      name: string;
-      slug: string;
-      runtime: string;
-      created_at: string;
-    }[];
+    const startedAt = Date.now();
+    try {
+      await ensureSchema();
+      const s = sql();
+      const rows =
+        await s`SELECT id, name, slug, runtime, created_at FROM projects WHERE owner_id = ${context.userId} ORDER BY created_at DESC`;
+
+      await logEvent(
+        null,
+        context.userId,
+        "info",
+        "projects.list",
+        "Loaded projects",
+        { count: rows.length, durationMs: Date.now() - startedAt },
+      );
+
+      return rows as {
+        id: string;
+        name: string;
+        slug: string;
+        runtime: string;
+        created_at: string;
+      }[];
+    } catch (error) {
+      await logEvent(
+        null,
+        context.userId,
+        "error",
+        "projects.list",
+        error instanceof Error ? error.message : "Unknown error",
+        {
+          durationMs: Date.now() - startedAt,
+          stack: error instanceof Error ? error.stack : String(error),
+        },
+      );
+      throw error;
+    }
   });
 
 export const createProject = createServerFn({ method: "POST" })

@@ -11,6 +11,7 @@
 // Env: NEON_URL, PROJECT_ID, ADMIN_TOKEN, PORT (default 8000)
 
 import { neon } from "https://esm.sh/@neondatabase/serverless@1.1.0";
+import { AsyncLocalStorage } from "node:async_hooks";
 
 const NEON_URL = Deno.env.get("NEON_URL");
 const PROJECT_ID = Deno.env.get("PROJECT_ID");
@@ -24,6 +25,7 @@ if (!NEON_URL || !PROJECT_ID) {
 }
 
 const sql = neon(NEON_URL);
+const outboundContext = new AsyncLocalStorage<{ function: string }>();
 
 // Seed PG* env vars from a user Postgres connection URL so user code that does
 // `new Pool()` (Deno postgres) without arguments connects automatically.
@@ -130,6 +132,154 @@ function applyProjectSecretsEnv(secrets: Record<string, string>) {
   // reads PG* during import, before handlers execute.
   seedPgEnvFromUrl(true);
 }
+
+function getCurrentInvocation() {
+  return outboundContext.getStore() || null;
+}
+
+function trimMaybeBody(value: string | Uint8Array | null, limit = 8000): string | null {
+  if (value == null) return null;
+  if (typeof value === "string") return value.length <= limit ? value : value.slice(0, limit) + "... [truncated " + String(value.length - limit) + " chars]";
+  const text = new TextDecoder().decode(value);
+  return text.length <= limit ? text : text.slice(0, limit) + "... [truncated " + String(text.length - limit) + " chars]";
+}
+
+function headersToObject(headers: Headers): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const [key, value] of headers.entries()) {
+    out[key] = value;
+  }
+  return out;
+}
+
+function redactOutboundHeaders(headers: Headers): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const [key, value] of headers.entries()) {
+    if (/^(authorization|x-api-key|x-admin-token|x-vortex-log-token|cookie|set-cookie|proxy-authorization)$/i.test(key)) {
+      out[key] = "[redacted]";
+      continue;
+    }
+    out[key] = value;
+  }
+  return out;
+}
+
+function shouldSkipOutboundLog(target: string): boolean {
+  if (!target) return true;
+  if (!LOG_INGEST_URL) return false;
+  try {
+    return new URL(target).href === new URL(LOG_INGEST_URL).href;
+  } catch {
+    return target === LOG_INGEST_URL;
+  }
+}
+
+function queueOutboundLog(entry: {
+  method: string;
+  target: string;
+  requestHeaders: Record<string, string>;
+  requestBody: string | null;
+  status: number | null;
+  responseHeaders: Record<string, string>;
+  responseBody: string | null;
+  error?: string | null;
+  durationMs: number;
+}) {
+  const invocation = getCurrentInvocation();
+  if (!invocation) return;
+
+  void sendRuntimeLog({
+    level: entry.error ? "error" : (entry.status || 200) >= 400 ? "warn" : "info",
+    source: "outbound",
+    message: "-> " + entry.method + " " + entry.target + " | <- " + (entry.error ? "ERR" : String(entry.status || 0)) + " (" + entry.durationMs + "ms)",
+    meta: {
+      runtime: "deno",
+      function: invocation.function,
+      kind: "outbound",
+      target: entry.target,
+      request: {
+        method: entry.method,
+        path: (() => {
+          try {
+            const u = new URL(entry.target);
+            return u.pathname + u.search;
+          } catch {
+            return entry.target;
+          }
+        })(),
+        url: entry.target,
+        headers: entry.requestHeaders,
+        body: entry.requestBody,
+      },
+      response: {
+        status: entry.status,
+        headers: entry.responseHeaders,
+        body: entry.responseBody,
+      },
+      error: entry.error || null,
+      durationMs: entry.durationMs,
+    },
+  });
+}
+
+function installFetchOutboundLogging() {
+  if (typeof globalThis.fetch !== "function") return;
+  const originalFetch = globalThis.fetch.bind(globalThis);
+  globalThis.fetch = async function patchedFetch(input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
+    const request = input instanceof Request && init === undefined ? input : new Request(input, init);
+    const target = request.url;
+    if (shouldSkipOutboundLog(target) || !getCurrentInvocation()) {
+      return originalFetch(input, init);
+    }
+
+    const startedAt = Date.now();
+    const requestHeaders = redactOutboundHeaders(request.headers);
+    let requestBody: string | null = null;
+    if (!["GET", "HEAD"].includes(request.method)) {
+      try {
+        requestBody = trimMaybeBody(new TextDecoder().decode(await request.clone().arrayBuffer()));
+      } catch {
+        requestBody = "[unreadable]";
+      }
+    }
+
+    try {
+      const response = await originalFetch(request);
+      let responseBody: string | null = null;
+      try {
+        responseBody = trimMaybeBody(new TextDecoder().decode(await response.clone().arrayBuffer()));
+      } catch {
+        responseBody = "[unreadable]";
+      }
+      queueOutboundLog({
+        method: request.method,
+        target,
+        requestHeaders,
+        requestBody,
+        status: response.status,
+        responseHeaders: redactOutboundHeaders(response.headers),
+        responseBody,
+        durationMs: Date.now() - startedAt,
+      });
+      return response;
+    } catch (err) {
+      queueOutboundLog({
+        method: request.method,
+        target,
+        requestHeaders,
+        requestBody,
+        status: null,
+        responseHeaders: {},
+        responseBody: null,
+        error: err instanceof Error ? err.message : String(err),
+        durationMs: Date.now() - startedAt,
+      });
+      throw err;
+    }
+  };
+}
+
+installFetchOutboundLogging();
 
 async function writeFilesToDir(
   dir: string,
@@ -387,8 +537,10 @@ __origServe({ port: PORT, hostname: "0.0.0.0" }, async (req) => {
   applyProjectSecretsEnv(projectSecrets);
   applyTokenEnv(tokens);
   try {
-    const res = await fn.handler(innerReq, { tokens, functionId: fn.id });
-    return withCors(res, origin);
+    return await outboundContext.run({ function: slug }, async () => {
+      const res = await fn.handler(innerReq, { tokens, functionId: fn.id });
+      return withCors(res, origin);
+    });
   } catch (err) {
     console.error(`[runner] ${slug} threw:`, err);
     return withCors(new Response(
@@ -399,4 +551,3 @@ __origServe({ port: PORT, hostname: "0.0.0.0" }, async (req) => {
 });
 
 console.log(`[runner] project=${PROJECT_ID} listening on :${PORT} version=${RUNNER_VERSION}`);
-

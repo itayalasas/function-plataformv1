@@ -22,7 +22,8 @@ export const Route = createFileRoute("/api/cli/installer")({
           return jsonError(401, "Unauthorized");
         }
 
-        const { filename, script } = await buildVortexInstallerScript();
+        const platformBaseUrl = new URL(request.url).origin;
+        const { filename, script } = await buildVortexInstallerScript(platformBaseUrl);
         return new Response(script, {
           status: 200,
           headers: {

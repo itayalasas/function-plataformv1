@@ -106,6 +106,7 @@ const INSTALLER_ENV_KEYS = [
   "NEON_DATABASE_URL_POOLER",
   "NEON_DATABASE_URL",
   "DATABASE_URL",
+  "VORTEX_PUBLIC_BASE_URL",
   "AZURE_TENANT_ID",
   "AZURE_CLIENT_ID",
   "AZURE_CLIENT_SECRET",
@@ -120,13 +121,22 @@ function escapeEnvValue(value: string): string {
   return value.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
 }
 
-function buildInstallerEnvFile(): InstallerFile | null {
+function buildInstallerEnvFile(platformBaseUrl?: string): InstallerFile | null {
   const lines: string[] = [];
+  const addedKeys = new Set<string>();
 
   for (const key of INSTALLER_ENV_KEYS) {
     const value = process.env[key]?.trim();
     if (!value) continue;
+    if (addedKeys.has(key)) continue;
     lines.push(`${key}="${escapeEnvValue(value)}"`);
+    addedKeys.add(key);
+  }
+
+  const normalizedPlatformBaseUrl = (platformBaseUrl?.trim() ?? "").replace(/\/+$/, "");
+  if (normalizedPlatformBaseUrl && !addedKeys.has("VORTEX_PUBLIC_BASE_URL")) {
+    lines.push(`VORTEX_PUBLIC_BASE_URL="${escapeEnvValue(normalizedPlatformBaseUrl)}"`);
+    addedKeys.add("VORTEX_PUBLIC_BASE_URL");
   }
 
   if (!lines.length) return null;
@@ -134,6 +144,16 @@ function buildInstallerEnvFile(): InstallerFile | null {
   return {
     path: ".vortex/.env",
     content: `${lines.join("\n")}\n`,
+  };
+}
+
+function buildInstallerPlatformFile(platformBaseUrl?: string): InstallerFile | null {
+  const normalizedPlatformBaseUrl = (platformBaseUrl?.trim() ?? "").replace(/\/+$/, "");
+  if (!normalizedPlatformBaseUrl) return null;
+
+  return {
+    path: ".vortex/platform.json",
+    content: `${JSON.stringify({ platformBaseUrl: normalizedPlatformBaseUrl }, null, 2)}\n`,
   };
 }
 
@@ -277,17 +297,20 @@ main().catch((error) => {
 `;
 }
 
-export async function buildVortexInstallerScript(): Promise<{ filename: string; script: string }> {
+export async function buildVortexInstallerScript(
+  platformBaseUrl?: string,
+): Promise<{ filename: string; script: string }> {
   const repoRoot = findRepoRoot(process.cwd());
   const versions = await readPackageVersions(repoRoot);
   const files = await readInstallerFiles(repoRoot);
-  const rootEnvFile = buildInstallerEnvFile();
+  const rootEnvFile = buildInstallerEnvFile(platformBaseUrl);
+  const rootPlatformFile = buildInstallerPlatformFile(platformBaseUrl);
 
   const payload: InstallerPayload = {
     packageDir: ".vortex/cli",
     rootScript: ROOT_SCRIPT,
     gitignoreEntry: ".vortex/",
-    rootFiles: rootEnvFile ? [rootEnvFile] : [],
+    rootFiles: [rootEnvFile, rootPlatformFile].filter(Boolean) as InstallerFile[],
     packageJson: {
       name: "vortex-local-cli",
       private: true,

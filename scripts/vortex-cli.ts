@@ -9,9 +9,10 @@ import { getRuntimeConfig } from "../src/lib/runtimes/index.ts";
 import { deployLocalSource } from "../src/lib/cli/local-sync.server.ts";
 
 type CliConfig = {
-  projectId: string;
-  sourceRoot: string;
-  linkedAt: string;
+  projectId?: string;
+  sourceRoot?: string;
+  linkedAt?: string;
+  platformBaseUrl?: string;
 };
 
 type ParsedArgs = {
@@ -27,6 +28,7 @@ type DeployProgressLogger = (
 ) => void;
 
 const CONFIG_PATH = path.resolve(process.cwd(), ".vortex", "config.json");
+const PLATFORM_CONFIG_PATH = path.resolve(process.cwd(), ".vortex", "platform.json");
 
 function parseEnvFile(filePath: string): Record<string, string> {
   if (!fsSync.existsSync(filePath)) return {};
@@ -110,11 +112,16 @@ function hasFlag(flags: Map<string, string | boolean>, name: string): boolean {
   return flags.get(name) === true;
 }
 
+function normalizeConfiguredBaseUrl(input: string | null | undefined): string | undefined {
+  const value = (input?.trim() ?? "").replace(/\/+$/, "");
+  return value ? value : undefined;
+}
+
 function usage(): string {
   return `Vortex CLI
 
 Usage:
-  vortex link --project-id <uuid> [--source-root <dir>]
+  vortex link --project-id <uuid> [--source-root <dir>] [--platform-base-url <url>]
   vortex deploy [function-name] [--project-id <uuid>] [--source-root <dir>]
 
 Examples:
@@ -137,11 +144,11 @@ async function readConfig(configPath: string): Promise<CliConfig | null> {
   try {
     const raw = await fs.readFile(configPath, "utf8");
     const parsed = JSON.parse(raw) as Partial<CliConfig>;
-    if (!parsed.projectId || !parsed.sourceRoot) return null;
     return {
       projectId: parsed.projectId,
       sourceRoot: parsed.sourceRoot,
-      linkedAt: parsed.linkedAt ?? new Date().toISOString(),
+      linkedAt: parsed.linkedAt,
+      platformBaseUrl: normalizeConfiguredBaseUrl(parsed.platformBaseUrl),
     };
   } catch (error) {
     if (error instanceof Error && "code" in error && (error as NodeJS.ErrnoException).code === "ENOENT") {
@@ -154,6 +161,19 @@ async function readConfig(configPath: string): Promise<CliConfig | null> {
 async function writeConfig(configPath: string, config: CliConfig): Promise<void> {
   await fs.mkdir(path.dirname(configPath), { recursive: true });
   await fs.writeFile(configPath, `${JSON.stringify(config, null, 2)}\n`, "utf8");
+}
+
+async function readPlatformBaseUrl(platformConfigPath: string): Promise<string | undefined> {
+  try {
+    const raw = await fs.readFile(platformConfigPath, "utf8");
+    const parsed = JSON.parse(raw) as { platformBaseUrl?: string };
+    return normalizeConfiguredBaseUrl(parsed.platformBaseUrl);
+  } catch (error) {
+    if (error instanceof Error && "code" in error && (error as NodeJS.ErrnoException).code === "ENOENT") {
+      return undefined;
+    }
+    return undefined;
+  }
 }
 
 async function loadProject(projectId: string) {
@@ -282,10 +302,18 @@ async function runLink(args: ParsedArgs): Promise<void> {
     throw new Error(`No encontré el proyecto ${projectId}.`);
   }
 
+  const existingConfig = await readConfig(CONFIG_PATH);
+  const platformBaseUrl =
+    normalizeConfiguredBaseUrl(getFlag(args.flags, ["platform-base-url", "platform-base", "platform"])) ??
+    normalizeConfiguredBaseUrl(process.env.VORTEX_PUBLIC_BASE_URL) ??
+    existingConfig?.platformBaseUrl ??
+    (await readPlatformBaseUrl(PLATFORM_CONFIG_PATH));
+
   const config: CliConfig = {
     projectId,
     sourceRoot: path.relative(process.cwd(), sourceRoot) || ".",
     linkedAt: new Date().toISOString(),
+    platformBaseUrl,
   };
   await writeConfig(CONFIG_PATH, config);
 
@@ -293,6 +321,9 @@ async function runLink(args: ParsedArgs): Promise<void> {
   console.log(`Proyecto enlazado: ${project.name} (${project.slug})`);
   console.log(`Runtime: ${runtime.label}`);
   console.log(`Source root: ${config.sourceRoot}`);
+  if (platformBaseUrl) {
+    console.log(`Platform base URL: ${platformBaseUrl}`);
+  }
   console.log(`Config: ${path.relative(process.cwd(), CONFIG_PATH)}`);
 }
 
@@ -314,6 +345,11 @@ async function runDeploy(args: ParsedArgs): Promise<void> {
     config?.sourceRoot ??
     "functions";
   const sourceRoot = resolveSourceRoot(sourceRootInput, "functions");
+  const platformBaseUrl =
+    normalizeConfiguredBaseUrl(getFlag(args.flags, ["platform-base-url", "platform-base", "platform"])) ??
+    normalizeConfiguredBaseUrl(process.env.VORTEX_PUBLIC_BASE_URL) ??
+    config?.platformBaseUrl ??
+    (await readPlatformBaseUrl(PLATFORM_CONFIG_PATH));
   const functionName =
     getFlag(args.flags, ["function", "f"]) ??
     args.positionals.find((value) => value !== projectId);
@@ -323,6 +359,7 @@ async function runDeploy(args: ParsedArgs): Promise<void> {
     projectId,
     sourceRoot,
     functionName: functionName === "all" ? null : functionName ?? null,
+    platformBaseUrl,
     progress,
   });
 

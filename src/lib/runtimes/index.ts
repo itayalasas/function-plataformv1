@@ -119,6 +119,199 @@ function startupJava(): string {
     "apk add --no-cache jq curl netcat-openbsd >/dev/null 2>&1 || true",
     'seen=/tmp/java-seen-paths.txt; : > "$seen"; jq -c ".[]" /tmp/files.json | while IFS= read -r row; do kind=$(echo "$row" | jq -r \'.kind // "file"\'); path=$(echo "$row" | jq -r \'.path\'); if grep -Fxq "$path" "$seen"; then echo "[boot] skipping duplicate path $path"; continue; fi; printf "%s\\n" "$path" >> "$seen"; if [ "$kind" = "dir" ]; then mkdir -p "$path"; else content=$(echo "$row" | jq -r \'.content\'); mkdir -p "$(dirname "$path")"; printf "%s" "$content" > "$path"; fi; done',
     'echo "[boot] extracted java sources"; ls -R /app/build | head -50; (while [ ! -f /tmp/build-done ]; do (printf \'HTTP/1.1 200 OK\\r\\nContent-Type: application/json\\r\\n\\r\\n{"status":"building"}\' | nc -l -p 8000 -q 1 >/dev/null 2>&1) || sleep 1; done) & echo "[boot] running mvn package (this may take 1-3 min)"',
+    `JAVA_APP_FILE=$(find /app/build/src/main/java -name App.java | head -n1)
+if [ -n "$JAVA_APP_FILE" ]; then
+  JAVA_APP_DIR=$(dirname "$JAVA_APP_FILE")
+  JAVA_APP_PACKAGE_PATH=$(printf '%s' "$JAVA_APP_FILE" | sed 's#^/app/build/src/main/java/##; s#/App.java$##')
+  JAVA_APP_PACKAGE=$(printf '%s' "$JAVA_APP_PACKAGE_PATH" | tr '/' '.')
+  if [ -n "$JAVA_APP_PACKAGE" ]; then
+    JAVA_RUNTIME_DIR="$JAVA_APP_DIR/logging"
+    mkdir -p "$JAVA_RUNTIME_DIR"
+    cat > "$JAVA_RUNTIME_DIR/RuntimeLoggingFilter.java" <<'JAVA'
+package __JAVA_RUNTIME_PACKAGE__.logging;
+
+import com.fasterxml.jackson.databind.ObjectMapper;
+import jakarta.servlet.FilterChain;
+import jakarta.servlet.ServletException;
+import jakarta.servlet.http.HttpServletRequest;
+import jakarta.servlet.http.HttpServletResponse;
+import org.springframework.core.Ordered;
+import org.springframework.core.annotation.Order;
+import org.springframework.stereotype.Component;
+import org.springframework.web.filter.ContentCachingRequestWrapper;
+import org.springframework.web.filter.ContentCachingResponseWrapper;
+import org.springframework.web.filter.OncePerRequestFilter;
+
+import java.io.IOException;
+import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
+import java.nio.charset.StandardCharsets;
+import java.time.Duration;
+import java.util.Enumeration;
+import java.util.LinkedHashMap;
+import java.util.Map;
+
+@Component
+@Order(Ordered.HIGHEST_PRECEDENCE)
+public class RuntimeLoggingFilter extends OncePerRequestFilter {
+    private static final ObjectMapper MAPPER = new ObjectMapper();
+    private static final HttpClient CLIENT = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(3)).build();
+    private static final int LIMIT = 8000;
+    private final String ingestUrl = System.getenv("VORTEX_LOG_INGEST_URL");
+    private final String token = System.getenv("VORTEX_LOG_TOKEN");
+    private final String projectId = System.getenv("PROJECT_ID");
+
+    @Override
+    protected boolean shouldNotFilter(HttpServletRequest request) {
+        return ingestUrl == null || ingestUrl.isBlank() || token == null || token.isBlank() || projectId == null || projectId.isBlank();
+    }
+
+    @Override
+    protected void doFilterInternal(HttpServletRequest request, HttpServletResponse response, FilterChain filterChain)
+            throws ServletException, IOException {
+        ContentCachingRequestWrapper requestWrapper = new ContentCachingRequestWrapper(request);
+        ContentCachingResponseWrapper responseWrapper = new ContentCachingResponseWrapper(response);
+        long startedAt = System.currentTimeMillis();
+        Exception error = null;
+        try {
+            filterChain.doFilter(requestWrapper, responseWrapper);
+        } catch (Exception e) {
+            error = e;
+            if (!responseWrapper.isCommitted()) {
+                responseWrapper.setStatus(HttpServletResponse.SC_INTERNAL_SERVER_ERROR);
+            }
+            if (e instanceof ServletException servletException) throw servletException;
+            if (e instanceof IOException ioException) throw ioException;
+            throw new ServletException(e);
+        } finally {
+            try {
+                String requestBody = trimText(new String(requestWrapper.getContentAsByteArray(), StandardCharsets.UTF_8));
+                String responseBody = trimText(new String(responseWrapper.getContentAsByteArray(), StandardCharsets.UTF_8));
+                Map<String, Object> payload = new LinkedHashMap<>();
+                payload.put("projectId", projectId);
+                payload.put("token", token);
+                payload.put("level", error != null ? "error" : (responseWrapper.getStatus() >= 400 ? "warn" : "info"));
+                payload.put("source", "runtime");
+                payload.put("message", "-> " + request.getMethod() + " " + requestPath(request) + " | <- " + (error != null ? "ERR" : responseWrapper.getStatus()) + " (" + (System.currentTimeMillis() - startedAt) + "ms)");
+
+                Map<String, Object> meta = new LinkedHashMap<>();
+                meta.put("runtime", "java");
+                meta.put("function", request.getRequestURI());
+                meta.put("request", requestPayload(request, requestBody));
+                meta.put("response", responsePayload(responseWrapper, responseBody));
+                meta.put("durationMs", System.currentTimeMillis() - startedAt);
+                if (error != null) {
+                    meta.put("error", error.getMessage());
+                }
+                payload.put("meta", meta);
+
+                sendRuntimeLog(payload);
+            } finally {
+                responseWrapper.copyBodyToResponse();
+            }
+        }
+    }
+
+    private static Map<String, Object> requestPayload(HttpServletRequest request, String requestBody) {
+        Map<String, Object> requestPayload = new LinkedHashMap<>();
+        requestPayload.put("method", request.getMethod());
+        requestPayload.put("path", requestPath(request));
+        requestPayload.put("headers", redactHeaders(request));
+        requestPayload.put("body", requestBody.isEmpty() ? null : requestBody);
+        Map<String, Object> query = new LinkedHashMap<>();
+        if (request.getParameterMap() != null) {
+            for (Map.Entry<String, String[]> entry : request.getParameterMap().entrySet()) {
+                String[] values = entry.getValue();
+                if (values == null || values.length == 0) {
+                    query.put(entry.getKey(), "");
+                } else if (values.length == 1) {
+                    query.put(entry.getKey(), values[0]);
+                } else {
+                    query.put(entry.getKey(), values);
+                }
+            }
+        }
+        requestPayload.put("query", query);
+        return requestPayload;
+    }
+
+    private static Map<String, Object> responsePayload(ContentCachingResponseWrapper response, String responseBody) {
+        Map<String, Object> responsePayload = new LinkedHashMap<>();
+        responsePayload.put("status", response.getStatus());
+        responsePayload.put("headers", redactHeaders(response));
+        responsePayload.put("body", responseBody);
+        return responsePayload;
+    }
+
+    private static String requestPath(HttpServletRequest request) {
+        String query = request.getQueryString();
+        return request.getRequestURI() + (query == null || query.isBlank() ? "" : "?" + query);
+    }
+
+    private static Map<String, Object> redactHeaders(HttpServletRequest request) {
+        Map<String, Object> headers = new LinkedHashMap<>();
+        Enumeration<String> names = request.getHeaderNames();
+        if (names == null) return headers;
+        while (names.hasMoreElements()) {
+            String name = names.nextElement();
+            headers.put(name, redactHeaderValue(name, request.getHeader(name)));
+        }
+        return headers;
+    }
+
+    private static Map<String, Object> redactHeaders(ContentCachingResponseWrapper response) {
+        Map<String, Object> headers = new LinkedHashMap<>();
+        for (String name : response.getHeaderNames()) {
+            headers.put(name, redactHeaderValue(name, response.getHeader(name)));
+        }
+        return headers;
+    }
+
+    private static Object redactHeaderValue(String name, String value) {
+        if (name == null) return value;
+        String normalized = name.toLowerCase();
+        if (normalized.equals("authorization") || normalized.equals("x-api-key") || normalized.equals("x-admin-token") || normalized.equals("x-vortex-log-token")) {
+            return "[redacted]";
+        }
+        return value;
+    }
+
+    private static String trimText(String value) {
+        if (value == null) return "";
+        if (value.length() <= LIMIT) return value;
+        return value.substring(0, LIMIT) + "... [truncated " + (value.length() - LIMIT) + " chars]";
+    }
+
+    private void sendRuntimeLog(Map<String, Object> payload) {
+        try {
+            String json = MAPPER.writeValueAsString(payload);
+            HttpRequest request = HttpRequest.newBuilder(URI.create(ingestUrl))
+                    .header("content-type", "application/json")
+                    .header("x-vortex-log-token", token)
+                    .timeout(Duration.ofSeconds(3))
+                    .POST(HttpRequest.BodyPublishers.ofString(json, StandardCharsets.UTF_8))
+                    .build();
+            CLIENT.sendAsync(request, HttpResponse.BodyHandlers.discarding())
+                    .exceptionally(error -> {
+                        System.out.println("[runner] failed to send runtime log: " + error);
+                        return null;
+                    });
+        } catch (Exception error) {
+            System.out.println("[runner] failed to send runtime log: " + error);
+        }
+    }
+}
+JAVA
+    perl -0pi -e "s/__JAVA_RUNTIME_PACKAGE__/$JAVA_APP_PACKAGE/g" "$JAVA_RUNTIME_DIR/RuntimeLoggingFilter.java"
+    echo "[boot] injected Java runtime logging filter"
+  else
+    echo "[boot][warn] Java App.java found but package path was empty; skipping runtime logging filter injection"
+  fi
+else
+  echo "[boot][warn] no App.java found; skipping runtime logging filter injection"
+fi`,
     "mvn -B -q -DskipTests clean package",
     "touch /tmp/build-done; sleep 1; pkill -f 'nc -l -p 8000' >/dev/null 2>&1 || true",
     'JAR=$(ls target/*.jar 2>/dev/null | grep -v "original" | head -n1)',
@@ -142,6 +335,237 @@ function startupDotnet(): string {
     "apt-get update -qq && apt-get install -y -qq jq netcat-openbsd >/dev/null 2>&1 || true",
     'jq -c ".[]" /tmp/files.json | while IFS= read -r row; do kind=$(echo "$row" | jq -r ".kind // \\"file\\""); path=$(echo "$row" | jq -r ".path"); if [ "$kind" = "dir" ]; then mkdir -p "$path"; else content=$(echo "$row" | jq -r ".content"); mkdir -p "$(dirname "$path")"; printf "%s" "$content" > "$path"; fi; done',
     'echo "[boot] extracted .NET sources"; ls -R /app/build | head -50; (while [ ! -f /tmp/build-done ]; do (printf \'HTTP/1.1 200 OK\\r\\nContent-Type: application/json\\r\\n\\r\\n{"status":"building"}\' | nc -l -p 8000 -q 1 >/dev/null 2>&1) || sleep 1; done) & echo "[boot] running dotnet publish (this may take 1-2 min)"',
+    `DOTNET_PROGRAM_FILE=$(find /app/build -name Program.cs | head -n1)
+if [ -n "$DOTNET_PROGRAM_FILE" ]; then
+  DOTNET_PROJECT_DIR=$(dirname "$DOTNET_PROGRAM_FILE")
+  if ! grep -q "UseRuntimeLogging" "$DOTNET_PROGRAM_FILE"; then
+    cat > "$DOTNET_PROJECT_DIR/RuntimeLogging.cs" <<'CS'
+using System.Text;
+using System.Text.Json;
+using Microsoft.AspNetCore.Http;
+
+namespace VortexRuntime;
+
+public static class RuntimeLoggingExtensions
+{
+    private const int LIMIT = 8000;
+    private static readonly HttpClient Client = new()
+    {
+        Timeout = TimeSpan.FromSeconds(3)
+    };
+
+    public static WebApplication UseRuntimeLogging(this WebApplication app)
+    {
+        var ingestUrl = Environment.GetEnvironmentVariable("VORTEX_LOG_INGEST_URL");
+        var token = Environment.GetEnvironmentVariable("VORTEX_LOG_TOKEN");
+        var projectId = Environment.GetEnvironmentVariable("PROJECT_ID");
+        if (string.IsNullOrWhiteSpace(ingestUrl) || string.IsNullOrWhiteSpace(token) || string.IsNullOrWhiteSpace(projectId))
+        {
+            return app;
+        }
+
+        app.Use(async (context, next) =>
+        {
+            var startedAt = DateTimeOffset.UtcNow;
+            context.Request.EnableBuffering();
+            var requestBody = await ReadBodyAsync(context.Request.Body);
+            context.Request.Body.Position = 0;
+
+            var originalBody = context.Response.Body;
+            await using var responseBuffer = new MemoryStream();
+            context.Response.Body = responseBuffer;
+
+            Exception? error = null;
+            try
+            {
+                await next();
+            }
+            catch (Exception ex)
+            {
+                error = ex;
+                if (!context.Response.HasStarted)
+                {
+                    context.Response.StatusCode = StatusCodes.Status500InternalServerError;
+                }
+                throw;
+            }
+            finally
+            {
+                try
+                {
+                    responseBuffer.Position = 0;
+                    var responseBody = await ReadBodyAsync(responseBuffer);
+                    var durationMs = (long)(DateTimeOffset.UtcNow - startedAt).TotalMilliseconds;
+                    var requestPath = context.Request.Path + context.Request.QueryString;
+                    var payload = BuildPayload(
+                        projectId,
+                        token,
+                        context.Request.Method,
+                        requestPath,
+                        requestBody,
+                        context.Request.Headers,
+                        context.Response.StatusCode,
+                        context.Response.Headers,
+                        responseBody,
+                        durationMs,
+                        error
+                    );
+                    _ = SendRuntimeLogAsync(ingestUrl, token, payload);
+                    responseBuffer.Position = 0;
+                    await responseBuffer.CopyToAsync(originalBody);
+                }
+                finally
+                {
+                    context.Response.Body = originalBody;
+                }
+            }
+        });
+
+        return app;
+    }
+
+    private static Dictionary<string, object?> BuildPayload(
+        string projectId,
+        string token,
+        string method,
+        string requestPath,
+        string requestBody,
+        IHeaderDictionary requestHeaders,
+        int statusCode,
+        IHeaderDictionary responseHeaders,
+        string responseBody,
+        long durationMs,
+        Exception? error
+    )
+    {
+        var payload = new Dictionary<string, object?>
+        {
+            ["projectId"] = projectId,
+            ["token"] = token,
+            ["level"] = error != null ? "error" : statusCode >= 400 ? "warn" : "info",
+            ["source"] = "runtime",
+            ["message"] = "-> " + method + " " + requestPath + " | <- " + (error != null ? "ERR" : statusCode) + " (" + durationMs + "ms)",
+        };
+
+        var request = new Dictionary<string, object?>
+        {
+            ["method"] = method,
+            ["path"] = requestPath,
+            ["headers"] = RedactHeaders(requestHeaders),
+            ["body"] = string.IsNullOrWhiteSpace(requestBody) ? null : TrimText(requestBody),
+            ["query"] = RequestQuery(requestPath),
+        };
+
+        var response = new Dictionary<string, object?>
+        {
+            ["status"] = statusCode,
+            ["headers"] = RedactHeaders(responseHeaders),
+            ["body"] = TrimText(responseBody),
+        };
+
+        var meta = new Dictionary<string, object?>
+        {
+            ["runtime"] = "dotnet",
+            ["function"] = requestPath,
+            ["request"] = request,
+            ["response"] = response,
+            ["durationMs"] = durationMs,
+        };
+
+        if (error != null)
+        {
+            meta["error"] = error.Message;
+        }
+
+        payload["meta"] = meta;
+        return payload;
+    }
+
+    private static Dictionary<string, object?> RequestQuery(string requestPath)
+    {
+        var query = new Dictionary<string, object?>();
+        var index = requestPath.IndexOf('?');
+        if (index < 0 || index + 1 >= requestPath.Length)
+        {
+            return query;
+        }
+
+        var raw = requestPath[(index + 1)..];
+        foreach (var pair in raw.Split('&', StringSplitOptions.RemoveEmptyEntries))
+        {
+            var parts = pair.Split('=', 2);
+            var key = Uri.UnescapeDataString(parts[0]);
+            var value = parts.Length > 1 ? Uri.UnescapeDataString(parts[1]) : "";
+            query[key] = value;
+        }
+        return query;
+    }
+
+    private static Dictionary<string, object?> RedactHeaders(IHeaderDictionary headers)
+    {
+        var redacted = new Dictionary<string, object?>();
+        foreach (var header in headers)
+        {
+            redacted[header.Key] = RedactHeaderValue(header.Key, header.Value.ToString());
+        }
+        return redacted;
+    }
+
+    private static object RedactHeaderValue(string name, string? value)
+    {
+        var normalized = name.ToLowerInvariant();
+        if (normalized is "authorization" or "x-api-key" or "x-admin-token" or "x-vortex-log-token")
+        {
+            return "[redacted]";
+        }
+        return value ?? "";
+    }
+
+    private static string TrimText(string? value)
+    {
+        if (string.IsNullOrEmpty(value))
+        {
+            return "";
+        }
+
+        if (value.Length <= LIMIT)
+        {
+            return value;
+        }
+
+        return value[..LIMIT] + "... [truncated " + (value.Length - LIMIT) + " chars]";
+    }
+
+    private static async Task<string> ReadBodyAsync(Stream stream)
+    {
+        using var reader = new StreamReader(stream, Encoding.UTF8, leaveOpen: true);
+        var text = await reader.ReadToEndAsync();
+        return TrimText(text);
+    }
+
+    private static async Task SendRuntimeLogAsync(string ingestUrl, string token, Dictionary<string, object?> payload)
+    {
+        try
+        {
+            var json = JsonSerializer.Serialize(payload);
+            using var request = new HttpRequestMessage(HttpMethod.Post, ingestUrl);
+            request.Headers.TryAddWithoutValidation("x-vortex-log-token", token);
+            request.Content = new StringContent(json, Encoding.UTF8, "application/json");
+            using var response = await Client.SendAsync(request);
+            _ = await response.Content.ReadAsStringAsync();
+        }
+        catch (Exception error)
+        {
+            Console.WriteLine("[runner] failed to send runtime log: " + error.Message);
+        }
+    }
+}
+CS
+    perl -0pi -e "s/^/using VortexRuntime;\\n\\n/" "$DOTNET_PROGRAM_FILE"
+    perl -0pi -e "s/var app = builder.Build\\(\\);/var app = builder.Build();\\napp.UseRuntimeLogging();/" "$DOTNET_PROGRAM_FILE"
+    echo "[boot] injected .NET runtime logging middleware"
+  fi
+fi`,
     "dotnet publish -c Release -o /app/publish",
     "touch /tmp/build-done; sleep 1; pkill -f 'nc -l -p 8000' >/dev/null 2>&1 || true",
     "DLL=$(ls /app/publish/*.dll 2>/dev/null | head -n1)",

@@ -1,4 +1,5 @@
 import { createServerFn } from "@tanstack/react-start";
+import { getRequest } from "@tanstack/react-start/server";
 import { z } from "zod";
 import { requireAuthSystemAuth } from "@/lib/auth/server-middleware";
 import { sql, ensureSchema } from "@/lib/neon/db.server";
@@ -29,7 +30,21 @@ export const listDeployments = createServerFn({ method: "GET" })
 export const deployProject = createServerFn({ method: "POST" })
   .middleware([requireAuthSystemAuth])
   .inputValidator((d) => z.object({ projectId: z.string().uuid() }).parse(d))
-  .handler(async ({ data, context }) => deployProjectById({ projectId: data.projectId, ownerId: context.userId }));
+  .handler(async ({ data, context }) => {
+    let platformBaseUrl: string | undefined;
+    try {
+      const request = getRequest();
+      platformBaseUrl = request ? new URL(request.url).origin : undefined;
+    } catch {
+      platformBaseUrl = undefined;
+    }
+
+    return deployProjectById({
+      projectId: data.projectId,
+      ownerId: context.userId,
+      platformBaseUrl,
+    });
+  });
 
 export const refreshDeploymentStatus = createServerFn({ method: "POST" })
   .middleware([requireAuthSystemAuth])

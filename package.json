@@ -4,11 +4,11 @@
   "sideEffects": false,
   "type": "module",
   "scripts": {
-    "dev": "vite dev",
+    "dev": "node ./scripts/run-with-system-ca.mjs ./node_modules/vite/bin/vite.js dev",
     "build": "vite build",
     "build:dev": "vite build --mode development",
     "preview": "vite preview",
-    "vortex": "node --import ./scripts/register-ts-loader.mjs ./scripts/vortex-cli.ts",
+    "vortex": "node ./scripts/run-with-system-ca.mjs --import ./scripts/register-ts-loader.mjs ./scripts/vortex-cli.ts",
     "lint": "eslint .",
     "format": "prettier --write ."
   },

@@ -13,6 +13,7 @@ export type LocalSyncOptions = {
   projectId: string;
   sourceRoot: string;
   functionName?: string | null;
+  platformBaseUrl?: string | null;
   progress?: DeployProgressLogger;
 };
 
@@ -165,6 +166,7 @@ export async function deployLocalSource({
   projectId,
   sourceRoot,
   functionName,
+  platformBaseUrl,
   progress,
 }: LocalSyncOptions): Promise<LocalSyncResult> {
   const project = await getProject(projectId);
@@ -202,6 +204,7 @@ export async function deployLocalSource({
   const deployment = await deployProjectById({
     projectId: project.id,
     ownerId: project.owner_id,
+    platformBaseUrl,
     progress,
   });
 
