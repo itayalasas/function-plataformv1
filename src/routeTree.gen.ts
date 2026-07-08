@@ -18,6 +18,8 @@ import { Route as AuthenticatedDashboardRouteImport } from './routes/_authentica
 import { Route as AuthenticatedAppRouteImport } from './routes/_authenticated/app'
 import { Route as ApiCliInstallerRouteImport } from './routes/api/cli/installer'
 import { Route as ApiProjectsProjectIdExportRouteImport } from './routes/api/projects/$projectId/export'
+import { Route as ApiProjectsProjectIdCloneRouteImport } from './routes/api/projects/$projectId/clone'
+import { Route as ApiProjectsProjectIdDeploymentsDeploymentIdRouteImport } from './routes/api/projects/$projectId/deployments/$deploymentId'
 
 const LoginRoute = LoginRouteImport.update({
   id: '/login',
@@ -64,6 +66,18 @@ const ApiProjectsProjectIdExportRoute =
     path: '/api/projects/$projectId/export',
     getParentRoute: () => rootRouteImport,
   } as any)
+const ApiProjectsProjectIdCloneRoute =
+  ApiProjectsProjectIdCloneRouteImport.update({
+    id: '/api/projects/$projectId/clone',
+    path: '/api/projects/$projectId/clone',
+    getParentRoute: () => rootRouteImport,
+  } as any)
+const ApiProjectsProjectIdDeploymentsDeploymentIdRoute =
+  ApiProjectsProjectIdDeploymentsDeploymentIdRouteImport.update({
+    id: '/api/projects/$projectId/deployments/$deploymentId',
+    path: '/api/projects/$projectId/deployments/$deploymentId',
+    getParentRoute: () => rootRouteImport,
+  } as any)
 
 export interface FileRoutesByFullPath {
   '/': typeof IndexRoute
@@ -73,7 +87,9 @@ export interface FileRoutesByFullPath {
   '/dashboard': typeof AuthenticatedDashboardRoute
   '/api/runtime-logs': typeof ApiRuntimeLogsRoute
   '/api/cli/installer': typeof ApiCliInstallerRoute
+  '/api/projects/$projectId/clone': typeof ApiProjectsProjectIdCloneRoute
   '/api/projects/$projectId/export': typeof ApiProjectsProjectIdExportRoute
+  '/api/projects/$projectId/deployments/$deploymentId': typeof ApiProjectsProjectIdDeploymentsDeploymentIdRoute
 }
 export interface FileRoutesByTo {
   '/': typeof IndexRoute
@@ -83,7 +99,9 @@ export interface FileRoutesByTo {
   '/dashboard': typeof AuthenticatedDashboardRoute
   '/api/runtime-logs': typeof ApiRuntimeLogsRoute
   '/api/cli/installer': typeof ApiCliInstallerRoute
+  '/api/projects/$projectId/clone': typeof ApiProjectsProjectIdCloneRoute
   '/api/projects/$projectId/export': typeof ApiProjectsProjectIdExportRoute
+  '/api/projects/$projectId/deployments/$deploymentId': typeof ApiProjectsProjectIdDeploymentsDeploymentIdRoute
 }
 export interface FileRoutesById {
   __root__: typeof rootRouteImport
@@ -95,7 +113,9 @@ export interface FileRoutesById {
   '/_authenticated/dashboard': typeof AuthenticatedDashboardRoute
   '/api/runtime-logs': typeof ApiRuntimeLogsRoute
   '/api/cli/installer': typeof ApiCliInstallerRoute
+  '/api/projects/$projectId/clone': typeof ApiProjectsProjectIdCloneRoute
   '/api/projects/$projectId/export': typeof ApiProjectsProjectIdExportRoute
+  '/api/projects/$projectId/deployments/$deploymentId': typeof ApiProjectsProjectIdDeploymentsDeploymentIdRoute
 }
 export interface FileRouteTypes {
   fileRoutesByFullPath: FileRoutesByFullPath
@@ -107,7 +127,9 @@ export interface FileRouteTypes {
     | '/dashboard'
     | '/api/runtime-logs'
     | '/api/cli/installer'
+    | '/api/projects/$projectId/clone'
     | '/api/projects/$projectId/export'
+    | '/api/projects/$projectId/deployments/$deploymentId'
   fileRoutesByTo: FileRoutesByTo
   to:
     | '/'
@@ -117,7 +139,9 @@ export interface FileRouteTypes {
     | '/dashboard'
     | '/api/runtime-logs'
     | '/api/cli/installer'
+    | '/api/projects/$projectId/clone'
     | '/api/projects/$projectId/export'
+    | '/api/projects/$projectId/deployments/$deploymentId'
   id:
     | '__root__'
     | '/'
@@ -128,7 +152,9 @@ export interface FileRouteTypes {
     | '/_authenticated/dashboard'
     | '/api/runtime-logs'
     | '/api/cli/installer'
+    | '/api/projects/$projectId/clone'
     | '/api/projects/$projectId/export'
+    | '/api/projects/$projectId/deployments/$deploymentId'
   fileRoutesById: FileRoutesById
 }
 export interface RootRouteChildren {
@@ -138,7 +164,9 @@ export interface RootRouteChildren {
   LoginRoute: typeof LoginRoute
   ApiRuntimeLogsRoute: typeof ApiRuntimeLogsRoute
   ApiCliInstallerRoute: typeof ApiCliInstallerRoute
+  ApiProjectsProjectIdCloneRoute: typeof ApiProjectsProjectIdCloneRoute
   ApiProjectsProjectIdExportRoute: typeof ApiProjectsProjectIdExportRoute
+  ApiProjectsProjectIdDeploymentsDeploymentIdRoute: typeof ApiProjectsProjectIdDeploymentsDeploymentIdRoute
 }
 
 declare module '@tanstack/react-router' {
@@ -206,6 +234,20 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof ApiProjectsProjectIdExportRouteImport
       parentRoute: typeof rootRouteImport
     }
+    '/api/projects/$projectId/clone': {
+      id: '/api/projects/$projectId/clone'
+      path: '/api/projects/$projectId/clone'
+      fullPath: '/api/projects/$projectId/clone'
+      preLoaderRoute: typeof ApiProjectsProjectIdCloneRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/api/projects/$projectId/deployments/$deploymentId': {
+      id: '/api/projects/$projectId/deployments/$deploymentId'
+      path: '/api/projects/$projectId/deployments/$deploymentId'
+      fullPath: '/api/projects/$projectId/deployments/$deploymentId'
+      preLoaderRoute: typeof ApiProjectsProjectIdDeploymentsDeploymentIdRouteImport
+      parentRoute: typeof rootRouteImport
+    }
   }
 }
 
@@ -230,7 +272,10 @@ const rootRouteChildren: RootRouteChildren = {
   LoginRoute: LoginRoute,
   ApiRuntimeLogsRoute: ApiRuntimeLogsRoute,
   ApiCliInstallerRoute: ApiCliInstallerRoute,
+  ApiProjectsProjectIdCloneRoute: ApiProjectsProjectIdCloneRoute,
   ApiProjectsProjectIdExportRoute: ApiProjectsProjectIdExportRoute,
+  ApiProjectsProjectIdDeploymentsDeploymentIdRoute:
+    ApiProjectsProjectIdDeploymentsDeploymentIdRoute,
 }
 export const routeTree = rootRouteImport
   ._addFileChildren(rootRouteChildren)

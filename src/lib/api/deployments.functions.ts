@@ -4,7 +4,7 @@ import { z } from "zod";
 import { requireAuthSystemAuth } from "@/lib/auth/server-middleware";
 import { sql, ensureSchema } from "@/lib/neon/db.server";
 import { getContainerApp } from "@/lib/azure/aca.server";
-import { deployProjectById } from "./deployments.shared";
+import { deployProjectById, reconcilePublicDomainBinding } from "./deployments.shared";
 import { getRuntimeConfig } from "@/lib/runtimes";
 
 export const listDeployments = createServerFn({ method: "GET" })
@@ -13,8 +13,31 @@ export const listDeployments = createServerFn({ method: "GET" })
   .handler(async ({ data, context }) => {
     await ensureSchema();
     const s = sql();
+    await reconcilePublicDomainBinding({
+      projectId: data.projectId,
+      ownerId: context.userId,
+    });
     const rows =
-      await s`SELECT id, version, container_app_name, fqdn, status, error, runtime, created_at FROM deployments WHERE project_id = ${data.projectId} AND owner_id = ${context.userId} ORDER BY version DESC LIMIT 20`;
+      await s`
+        SELECT
+          id,
+          version,
+          container_app_name,
+          fqdn,
+          status,
+          error,
+          runtime,
+          progress_percent,
+          progress_step,
+          progress_message,
+          created_at,
+          updated_at,
+          finished_at
+        FROM deployments
+        WHERE project_id = ${data.projectId} AND owner_id = ${context.userId}
+        ORDER BY version DESC
+        LIMIT 20
+      `;
     return rows as Array<{
       id: string;
       version: number;
@@ -24,6 +47,11 @@ export const listDeployments = createServerFn({ method: "GET" })
       error: string | null;
       runtime: string | null;
       created_at: string;
+      updated_at: string;
+      finished_at: string | null;
+      progress_percent: number;
+      progress_step: string | null;
+      progress_message: string | null;
     }>;
   });
 
@@ -52,10 +80,17 @@ export const refreshDeploymentStatus = createServerFn({ method: "POST" })
   .handler(async ({ data, context }) => {
     const s = sql();
     const rows =
-      (await s`SELECT container_app_name FROM deployments WHERE id = ${data.deploymentId} AND owner_id = ${context.userId}`) as Array<{
+      (await s`SELECT project_id, container_app_name FROM deployments WHERE id = ${data.deploymentId} AND owner_id = ${context.userId}`) as Array<{
+        project_id: string | null;
         container_app_name: string;
       }>;
     if (!rows[0]) throw new Error("Deployment not found");
+    if (rows[0].project_id) {
+      await reconcilePublicDomainBinding({
+        projectId: rows[0].project_id,
+        ownerId: context.userId,
+      });
+    }
     const info = await getContainerApp(rows[0].container_app_name);
     return info;
   });

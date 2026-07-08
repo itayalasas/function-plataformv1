@@ -24,3 +24,7 @@ export function getServerConfig() {
     //   stripeSecretKey: process.env.STRIPE_SECRET_KEY,
   };
 }
+
+export function getCloneApiToken(): string {
+  return process.env.VORTEX_CLONE_API_TOKEN?.trim() ?? "";
+}

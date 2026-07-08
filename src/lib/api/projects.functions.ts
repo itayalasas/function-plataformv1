@@ -3,6 +3,8 @@ import { z } from "zod";
 import { requireAuthSystemAuth } from "@/lib/auth/server-middleware";
 import { sql, ensureSchema, slugify, logEvent } from "@/lib/neon/db.server";
 import { RUNTIMES, type RuntimeId } from "@/lib/runtimes";
+import { cloneProjectAndDeploy } from "@/lib/api/project-clone.shared";
+import { applyDefaultStorageMountPath, reconcilePublicDomainBinding } from "@/lib/api/deployments.shared";
 import {
   deleteContainerApp,
   getContainerApp,
@@ -10,6 +12,7 @@ import {
   startContainerApp,
   stopContainerApp,
 } from "@/lib/azure/aca.server";
+import { getRequest } from "@tanstack/react-start/server";
 
 const runtimeSchema = z.enum(RUNTIMES as [RuntimeId, ...RuntimeId[]]);
 
@@ -84,11 +87,100 @@ export const createProject = createServerFn({ method: "POST" })
     const s = sql();
     const slug = slugify(data.name) + "-" + Math.random().toString(36).slice(2, 6);
     const runtime = data.runtime ?? "deno";
+    const deploymentProfileJson = JSON.stringify(
+      applyDefaultStorageMountPath({}),
+    );
     const rows =
-      await s`INSERT INTO projects (owner_id, name, slug, runtime) VALUES (${context.userId}, ${data.name}, ${slug}, ${runtime}) RETURNING id, name, slug, runtime, created_at`;
+      await s`
+        INSERT INTO projects (owner_id, name, slug, runtime, deployment_profile)
+        VALUES (${context.userId}, ${data.name}, ${slug}, ${runtime}, ${deploymentProfileJson}::jsonb)
+        RETURNING id, name, slug, runtime, created_at
+      `;
     return (
       rows as Array<{ id: string; name: string; slug: string; runtime: string; created_at: string }>
     )[0];
+  });
+
+const cloneProjectSchema = z
+  .object({
+    sourceProjectId: z.string().uuid(),
+    name: z.string().min(1).max(60),
+    cpu: z.number().positive().max(8).optional(),
+    memory: z.string().regex(/^\d+(\.\d+)?Gi$/i, "Use a value like 1Gi or 2Gi").optional(),
+    minReplicas: z.number().int().min(1).max(20).optional(),
+    maxReplicas: z.number().int().min(1).max(20).optional(),
+    storageMountPath: z.string().regex(/^\/[^\0]*$/, "Use an absolute mount path").optional(),
+    domain: z
+      .string()
+      .trim()
+      .min(1)
+      .max(253)
+      .regex(/^(?=.{1,253}$)(?!-)(?:[a-z0-9-]{1,63}\.)+[a-z]{2,63}$/i, "Use a valid domain")
+      .nullable()
+      .optional(),
+    subdomain: z
+      .string()
+      .trim()
+      .min(1)
+      .max(63)
+      .regex(/^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/i, "Use a valid subdomain")
+      .nullable()
+      .optional(),
+  })
+  .superRefine((value, ctx) => {
+    if (
+      typeof value.minReplicas === "number" &&
+      typeof value.maxReplicas === "number" &&
+      value.minReplicas > value.maxReplicas
+    ) {
+      ctx.addIssue({
+        code: "custom",
+        path: ["minReplicas"],
+        message: "minReplicas cannot be greater than maxReplicas",
+      });
+    }
+
+    if (value.subdomain && !value.domain) {
+      ctx.addIssue({
+        code: "custom",
+        path: ["domain"],
+        message: "domain is required when subdomain is provided",
+      });
+    }
+  });
+
+export const cloneProject = createServerFn({ method: "POST" })
+  .middleware([requireAuthSystemAuth])
+  .inputValidator((d) => cloneProjectSchema.parse(d))
+  .handler(async ({ data, context }) => {
+    let platformBaseUrl: string | undefined;
+    try {
+      const request = getRequest();
+      platformBaseUrl = request ? new URL(request.url).origin : undefined;
+    } catch {
+      platformBaseUrl = undefined;
+    }
+
+    const tenantLabel =
+      context.claims?.tenant?.name?.trim() ||
+      (context.claims?.tenant?.id ? `tenant-${context.claims.tenant.id.slice(0, 8)}` : null);
+
+    return cloneProjectAndDeploy({
+      sourceProjectId: data.sourceProjectId,
+      ownerId: context.userId,
+      requestedName: data.name,
+      tenantLabel,
+      platformBaseUrl,
+      domain: data.domain?.trim() || null,
+      subdomain: data.subdomain?.trim() || null,
+      deploymentOverrides: {
+        cpu: data.cpu,
+        memory: data.memory,
+        minReplicas: data.minReplicas,
+        maxReplicas: data.maxReplicas,
+        storageMountPath: data.storageMountPath,
+      },
+    });
   });
 
 export const updateProjectRuntime = createServerFn({ method: "POST" })
@@ -148,9 +240,16 @@ export const getProjectContainerAppStatus = createServerFn({ method: "GET" })
         defaultFqdn: null,
         runningStatus: "Not deployed",
         provisioningState: "Not deployed",
+        publicHostnameStatus: "none",
+        certificateState: null,
+        publicHostname: null,
       };
     }
 
+    const publicDomain = await reconcilePublicDomainBinding({
+      projectId: project.id,
+      ownerId: context.userId,
+    });
     const app = await getContainerApp(project.container_app_name);
     if (!app) {
       return {
@@ -162,6 +261,9 @@ export const getProjectContainerAppStatus = createServerFn({ method: "GET" })
         defaultFqdn: null,
         runningStatus: "Missing",
         provisioningState: "Missing",
+        publicHostnameStatus: publicDomain?.status ?? "none",
+        certificateState: publicDomain?.certificateState ?? null,
+        publicHostname: publicDomain?.publicHostname ?? null,
       };
     }
 
@@ -174,6 +276,9 @@ export const getProjectContainerAppStatus = createServerFn({ method: "GET" })
       defaultFqdn: app.defaultFqdn,
       runningStatus: app.runningStatus,
       provisioningState: app.provisioningState,
+      publicHostnameStatus: publicDomain?.status ?? "none",
+      certificateState: publicDomain?.certificateState ?? null,
+      publicHostname: publicDomain?.publicHostname ?? null,
     };
   });
 

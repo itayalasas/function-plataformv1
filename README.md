@@ -27,6 +27,7 @@ bun install
 3. Fill in the required values:
 
 - `NEON_DATABASE_URL`
+- `VORTEX_CLONE_API_TOKEN` to call the project clone API
 - `OPENAI_API_KEY`
 - `AZURE_TENANT_ID`
 - `AZURE_CLIENT_ID`
@@ -35,7 +36,11 @@ bun install
 - `AZURE_RESOURCE_GROUP`
 - `AZURE_LOCATION`
 - `AZURE_ACA_ENVIRONMENT`
+- `AZURE_STORAGE_ACCOUNT_NAME`
+- `AZURE_STORAGE_ACCOUNT_KEY`
+- `AZURE_STORAGE_RESOURCE_GROUP` if the storage account lives in another RG
 - `FN_RUNNER_IMAGE`
+- `VORTEX_DEFAULT_STORAGE_MOUNT_PATH` optional, defaults to `/data`
 
 4. Start the app:
 
@@ -111,6 +116,19 @@ so the same Neon and Azure variables used by the web app are reused
 automatically. The web installer writes the hidden `.vortex/.env` file for you
 when the platform has those values configured.
 
+To call the project clone API from another app or a CLI, send the shared token
+in either of these headers:
+
+```http
+x-vortex-clone-token: <token>
+```
+
+or:
+
+```http
+Authorization: Bearer <token>
+```
+
 ### Web installer
 
 If you want to install the CLI into another project without copying the
@@ -139,6 +157,15 @@ The workflow:
 - pushes it to Azure Container Registry
 - creates the Azure Container App on the first deploy, then updates the image in place on later deploys so existing env vars and secrets stay intact
 - prints the public FQDN in the workflow summary
+
+Project clones and newly created projects now default to a persistent storage
+mount path so data can survive restarts. The platform provisions the Azure
+Files share and the Container Apps environment storage entry during deploy.
+That means the deploy environment must include:
+
+- an Azure Files-capable storage account
+- the storage account name and key in the app env/secrets
+- the storage resource group if it differs from the ACA resource group
 
 The container app must be able to pull from the private ACR. By default, the
 workflow assumes the Container App managed identity already has `AcrPull` on

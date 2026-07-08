@@ -230,7 +230,11 @@ export const validateFunction = createServerFn({ method: "POST" })
       const res = await fetch(url, {
         method: "POST",
         headers: { "content-type": "application/json", "x-admin-token": fn.admin_token },
-        body: JSON.stringify({ files, entrypoint: fn.entrypoint || "index.ts", functionId: fn.id }),
+        body: JSON.stringify({
+          files: sourceFiles,
+          entrypoint: fn.entrypoint || "index.ts",
+          functionId: fn.id,
+        }),
       });
       const text = await res.text();
       let json: { ok: boolean; error?: string };
@@ -260,6 +264,10 @@ export const validateFunction = createServerFn({ method: "POST" })
         "Fallo de red contactando contenedor",
         { error: msg, url },
       );
-      return { ok: false, code: "NETWORK_ERROR", error: `No se pudo contactar con el contenedor: ${msg}` };
+      return {
+        ok: false,
+        code: "NETWORK_ERROR",
+        error: `No se pudo contactar con el contenedor: ${msg}`,
+      };
     }
   });

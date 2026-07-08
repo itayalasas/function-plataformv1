@@ -333,9 +333,14 @@ async function loadFunction(slug: string): Promise<FnEntry | null> {
     return cached;
   }
 
-  const files = await sql`SELECT path, content FROM function_files WHERE function_id = ${fn.id}` as Array<{ path: string; content: string }>;
+  const files = await sql`SELECT path, content, kind FROM function_files WHERE function_id = ${fn.id}` as Array<{ path: string; content: string; kind: string }>;
+  const sourceFiles = files.filter((file) => file.kind !== "dir");
+  if (!sourceFiles.length) {
+    console.error(`[runner] no source files found for ${slug}`);
+    return null;
+  }
   const dir = `/tmp/fn/${slug}-${Date.now()}`;
-  await writeFilesToDir(dir, files);
+  await writeFilesToDir(dir, sourceFiles);
   const projectSecrets = await loadProjectSecrets();
   const functionTokens = await loadTokens(fn.id);
   applyProjectSecretsEnv(projectSecrets);

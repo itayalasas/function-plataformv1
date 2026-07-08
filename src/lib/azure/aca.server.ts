@@ -9,6 +9,10 @@ let _tokenCache: TokenCache | undefined;
 
 const API_VERSION = "2024-03-01";
 const LIFECYCLE_API_VERSION = "2026-01-01";
+const ENV_STORAGE_API_VERSION = "2026-01-01";
+const ENVIRONMENT_API_VERSION = "2026-01-01";
+const MANAGED_CERTIFICATE_API_VERSION = "2026-01-01";
+const STORAGE_SHARE_API_VERSION = "2026-04-01";
 
 interface AzureEnv {
   tenantId: string;
@@ -25,6 +29,21 @@ const ACA_NAME_RE = /^[a-z][a-z0-9-]{1,30}[a-z0-9]$/;
 const LOCATION_RE = /^[a-z0-9]+$/;
 const DEFAULT_RUNNER_IMAGE = "denoland/deno:alpine-1.46.3";
 const IMAGE_REF_RE = /^[a-z0-9]+(?:(?:[._-][a-z0-9]+)+)?(?:\/[a-z0-9]+(?:(?:[._-][a-z0-9]+)+)?)*(?::[A-Za-z0-9_.-]{1,128})?(?:@[A-Za-z][A-Za-z0-9]*:[A-Fa-f0-9]{32,})?$/;
+
+export interface DeployProgressState {
+  percent: number;
+  step: string;
+  message: string;
+  level?: "info" | "warn" | "error";
+  status?: "building" | "provisioning" | "live" | "failed";
+  meta?: Record<string, unknown>;
+}
+
+export interface AcaCustomDomain {
+  name: string;
+  bindingType?: string;
+  certificateId?: string;
+}
 
 export function sanitizeAcaName(input: string, fallback = "app"): string {
   let s = (input || fallback).toLowerCase().normalize("NFKD").replace(/[\u0300-\u036f]/g, "");
@@ -83,6 +102,40 @@ function azureEnv(): AzureEnv {
   } as AzureEnv;
 }
 
+function normalizeHostname(input: string): string {
+  return input.trim().toLowerCase().replace(/\.+$/g, "");
+}
+
+function mergeAcaCustomDomains(incoming: AcaCustomDomain[], existing: AcaCustomDomain[]): AcaCustomDomain[] {
+  const merged = new Map<string, AcaCustomDomain>();
+  for (const domain of incoming) {
+    if (!domain?.name) continue;
+    merged.set(normalizeHostname(domain.name), domain);
+  }
+  for (const domain of existing) {
+    if (!domain?.name) continue;
+    const key = normalizeHostname(domain.name);
+    if (!merged.has(key)) {
+      merged.set(key, domain);
+    }
+  }
+  return Array.from(merged.values());
+}
+
+function environmentResourceUrl(apiVersion = ENVIRONMENT_API_VERSION): string {
+  return `${envBase()}/providers/Microsoft.App/managedEnvironments/${azureEnv().environment}?api-version=${apiVersion}`;
+}
+
+function managedCertificateResourceUrl(certificateName: string): string {
+  const e = azureEnv();
+  return `${envBase()}/providers/Microsoft.App/managedEnvironments/${e.environment}/managedCertificates/${encodeURIComponent(certificateName)}?api-version=${MANAGED_CERTIFICATE_API_VERSION}`;
+}
+
+function managedCertificateResourceId(certificateName: string): string {
+  const e = azureEnv();
+  return `/subscriptions/${e.subscriptionId}/resourceGroups/${e.resourceGroup}/providers/Microsoft.App/managedEnvironments/${e.environment}/managedCertificates/${encodeURIComponent(certificateName)}`;
+}
+
 
 async function getToken(): Promise<string> {
   const now = Math.floor(Date.now() / 1000);
@@ -112,6 +165,169 @@ function envBase(): string {
 function envId(): string {
   const e = azureEnv();
   return `/subscriptions/${e.subscriptionId}/resourceGroups/${e.resourceGroup}/providers/Microsoft.App/managedEnvironments/${e.environment}`;
+}
+
+interface AzureStorageEnv {
+  accountName: string;
+  accountKey: string;
+  resourceGroup: string;
+}
+
+function azureStorageEnv(): AzureStorageEnv {
+  const accountName = (process.env.AZURE_STORAGE_ACCOUNT_NAME || "").trim();
+  const accountKey = (process.env.AZURE_STORAGE_ACCOUNT_KEY || "").trim();
+  const resourceGroup = (process.env.AZURE_STORAGE_RESOURCE_GROUP || process.env.AZURE_RESOURCE_GROUP || "").trim();
+  const missing = [
+    !accountName ? "AZURE_STORAGE_ACCOUNT_NAME" : "",
+    !accountKey ? "AZURE_STORAGE_ACCOUNT_KEY" : "",
+    !resourceGroup ? "AZURE_STORAGE_RESOURCE_GROUP / AZURE_RESOURCE_GROUP" : "",
+  ].filter(Boolean);
+  if (missing.length) {
+    throw new Error(`Missing Azure storage env vars: ${missing.join(", ")}`);
+  }
+  return { accountName, accountKey, resourceGroup };
+}
+
+function sanitizeStorageShareName(input: string, fallback = "data"): string {
+  let s = (input || fallback).toLowerCase().normalize("NFKD").replace(/[\u0300-\u036f]/g, "");
+  s = s.replace(/[^a-z0-9-]/g, "-").replace(/-+/g, "-").replace(/^-+|-+$/g, "");
+  if (!/^[a-z0-9]/.test(s)) s = `a${s}`;
+  if (s.length < 3) s = `${s}${fallback}`;
+  if (s.length > 63) s = s.slice(0, 63).replace(/-+$/g, "") || fallback;
+  return s;
+}
+
+async function ensureAzureFileShare(input: {
+  accountName: string;
+  resourceGroup: string;
+  shareName: string;
+}): Promise<void> {
+  const e = azureEnv();
+  const shareUrl =
+    `https://management.azure.com/subscriptions/${e.subscriptionId}/resourceGroups/${input.resourceGroup}` +
+    `/providers/Microsoft.Storage/storageAccounts/${input.accountName}/fileServices/default/shares/${encodeURIComponent(input.shareName)}` +
+    `?api-version=${STORAGE_SHARE_API_VERSION}`;
+
+  const current = await armFetch(shareUrl);
+  if (current.ok) return;
+  if (current.status !== 404) {
+    throw new Error(`Storage share check failed: ${current.status} ${await current.text()}`);
+  }
+
+  const created = await armFetch(shareUrl, {
+    method: "PUT",
+    body: JSON.stringify({
+      properties: {
+        accessTier: "TransactionOptimized",
+      },
+    }),
+  });
+  if (!created.ok) {
+    throw new Error(`Create storage share failed: ${created.status} ${await created.text()}`);
+  }
+}
+
+async function ensureManagedEnvironmentStorage(input: {
+  storageName: string;
+  shareName: string;
+}): Promise<void> {
+  const e = azureEnv();
+  const storage = azureStorageEnv();
+  const storageUrl =
+    `https://management.azure.com/subscriptions/${e.subscriptionId}/resourceGroups/${e.resourceGroup}` +
+    `/providers/Microsoft.App/managedEnvironments/${e.environment}/storages/${encodeURIComponent(input.storageName)}` +
+    `?api-version=${ENV_STORAGE_API_VERSION}`;
+
+  const current = await armFetch(storageUrl);
+  if (current.ok) return;
+  if (current.status !== 404) {
+    throw new Error(`Storage mount check failed: ${current.status} ${await current.text()}`);
+  }
+
+  const created = await armFetch(storageUrl, {
+    method: "PUT",
+    body: JSON.stringify({
+      properties: {
+        azureFile: {
+          accessMode: "ReadWrite",
+          accountKey: storage.accountKey,
+          accountName: storage.accountName,
+          shareName: input.shareName,
+        },
+      },
+    }),
+  });
+  if (!created.ok) {
+    throw new Error(`Create Container Apps storage failed: ${created.status} ${await created.text()}`);
+  }
+}
+
+export interface PersistentStorageMount {
+  storageName: string;
+  volumes: Array<{
+    name: string;
+    storageType: "AzureFile";
+    storageName: string;
+  }>;
+  volumeMounts: Array<{
+    volumeName: string;
+    mountPath: string;
+  }>;
+}
+
+export async function ensurePersistentStorageMount(input: {
+  projectId: string;
+  containerAppName: string;
+  mountPath: string;
+  log?: (level: "info" | "warn" | "error", msg: string, meta?: Record<string, unknown>) => void;
+}): Promise<PersistentStorageMount> {
+  const log = input.log ?? (() => {});
+  const mountPath = input.mountPath.trim();
+  if (!mountPath) {
+    throw new Error("Persistent storage mount path is required");
+  }
+
+  await ensureInfra();
+  const storage = azureStorageEnv();
+  const storageName = sanitizeStorageShareName(`proj-${input.projectId.replace(/-/g, "")}-data`, "data");
+  const shareName = storageName;
+
+  log("info", "Ensuring Azure Files share for project storage", {
+    storageAccountName: storage.accountName,
+    storageResourceGroup: storage.resourceGroup,
+    shareName,
+  });
+  await ensureAzureFileShare({
+    accountName: storage.accountName,
+    resourceGroup: storage.resourceGroup,
+    shareName,
+  });
+
+  log("info", "Ensuring Container Apps environment storage", {
+    storageName,
+    shareName,
+  });
+  await ensureManagedEnvironmentStorage({
+    storageName,
+    shareName,
+  });
+
+  return {
+    storageName,
+    volumes: [
+      {
+        name: "data",
+        storageType: "AzureFile",
+        storageName,
+      },
+    ],
+    volumeMounts: [
+      {
+        volumeName: "data",
+        mountPath,
+      },
+    ],
+  };
 }
 
 async function armFetch(url: string, init?: RequestInit): Promise<Response> {
@@ -214,6 +430,148 @@ export async function ensureInfra(): Promise<void> {
   _infraReady = true;
 }
 
+export async function getManagedEnvironmentInfo(): Promise<ManagedEnvironmentInfo | null> {
+  await ensureInfra();
+  const url = environmentResourceUrl();
+  const res = await armFetch(url);
+  if (res.status === 404) return null;
+  if (!res.ok) throw new Error(`Azure managed environment get failed: ${res.status} ${await res.text()}`);
+  const data = (await res.json()) as {
+    properties?: {
+      provisioningState?: string;
+      staticIp?: string | null;
+    };
+  };
+  return {
+    staticIp: data.properties?.staticIp ?? null,
+    provisioningState: data.properties?.provisioningState ?? "Unknown",
+  };
+}
+
+export interface ManagedCertificateInfo {
+  id: string;
+  name: string;
+  provisioningState: string;
+  subjectName: string;
+  pending: boolean;
+}
+
+export async function getManagedCertificate(certificateName: string): Promise<ManagedCertificateInfo | null> {
+  await ensureInfra();
+  const normalizedName = certificateName.trim();
+  if (!normalizedName) {
+    throw new Error("Managed certificate name is required");
+  }
+  const url = managedCertificateResourceUrl(normalizedName);
+  const res = await armFetch(url);
+  if (res.status === 404) return null;
+  if (!res.ok) throw new Error(`Managed certificate get failed: ${res.status} ${await res.text()}`);
+  const data = (await res.json()) as {
+    id?: string;
+    name?: string;
+    properties?: {
+      provisioningState?: string;
+      subjectName?: string;
+    };
+  };
+  const provisioningState = data.properties?.provisioningState ?? "Unknown";
+  return {
+    id: data.id ?? managedCertificateResourceId(normalizedName),
+    name: data.name ?? normalizedName,
+    provisioningState,
+    subjectName: data.properties?.subjectName ?? normalizedName,
+    pending: provisioningState !== "Succeeded",
+  };
+}
+
+export async function createManagedCertificate(input: {
+  hostname: string;
+  validationMethod: "CNAME" | "HTTP" | "TXT";
+  certificateName?: string;
+  waitForCompletionMs?: number;
+  allowPending?: boolean;
+}): Promise<ManagedCertificateInfo> {
+  await ensureInfra();
+  const hostname = normalizeHostname(input.hostname);
+  if (!hostname) {
+    throw new Error("Managed certificate hostname is required");
+  }
+
+  const certificateName =
+    input.certificateName?.trim() ||
+    sanitizeAcaName(`cert-${hostname.replace(/\./g, "-")}`, "cert");
+  const url = managedCertificateResourceUrl(certificateName);
+
+  const put = await armFetch(url, {
+    method: "PUT",
+    body: JSON.stringify({
+      location: azureEnv().location,
+      properties: {
+        domainControlValidation: input.validationMethod,
+        subjectName: hostname,
+      },
+    }),
+  });
+  if (!put.ok) {
+    throw new Error(`Create managed certificate failed: ${put.status} ${await put.text()}`);
+  }
+
+  const deadline = Date.now() + Math.max(0, input.waitForCompletionMs ?? 120_000);
+  const allowPending = input.allowPending ?? false;
+  let lastState = "Unknown";
+  let lastResponse: {
+    id?: string;
+    name?: string;
+    properties?: {
+      provisioningState?: string;
+      subjectName?: string;
+    };
+  } | null = null;
+  while (Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 3000));
+    const poll = await armFetch(url);
+    if (poll.status === 404) continue;
+    if (!poll.ok) {
+      throw new Error(`Managed certificate check failed: ${poll.status} ${await poll.text()}`);
+    }
+    lastResponse = (await poll.json()) as {
+      id?: string;
+      name?: string;
+      properties?: {
+        provisioningState?: string;
+        subjectName?: string;
+      };
+    };
+    lastState = lastResponse.properties?.provisioningState ?? "Unknown";
+    if (lastState === "Succeeded") {
+      return {
+        id: lastResponse.id ?? managedCertificateResourceId(certificateName),
+        name: lastResponse.name ?? certificateName,
+        provisioningState: lastState,
+        subjectName: lastResponse.properties?.subjectName ?? hostname,
+        pending: false,
+      };
+    }
+    if (lastState === "Failed" || lastState === "Canceled") {
+      throw new Error(`Managed certificate provisioning ${lastState.toLowerCase()} for ${hostname}`);
+    }
+  }
+
+  if (allowPending) {
+    return {
+      id: lastResponse?.id ?? managedCertificateResourceId(certificateName),
+      name: lastResponse?.name ?? certificateName,
+      provisioningState: lastState,
+      subjectName: lastResponse?.properties?.subjectName ?? hostname,
+      pending: true,
+    };
+  }
+
+  throw new Error(
+    `Managed certificate "${certificateName}" no terminó de provisionarse (estado: ${lastState}).`,
+  );
+}
+
 
 export interface DeployFunctionInput {
   containerAppName: string;
@@ -241,8 +599,29 @@ export interface DeployFunctionInput {
   startupFailureThreshold?: number;
   /** override startup probe periodSeconds (default 5) */
   startupPeriodSeconds?: number;
+  /** override minimum replicas (default 1) */
+  minReplicas?: number;
+  /** override maximum replicas (default 3) */
+  maxReplicas?: number;
+  /** optional template volumes for the main container */
+  volumes?: Array<{
+    name: string;
+    storageType?: "EmptyDir" | "AzureFile" | "Secret" | "NfsAzureFile";
+    storageName?: string;
+    mountOptions?: string;
+  }>;
+  /** optional mounts attached to the main container */
+  volumeMounts?: Array<{
+    volumeName: string;
+    mountPath: string;
+    subPath?: string;
+  }>;
+  /** optional custom domain bindings to attach after certificate issuance */
+  customDomains?: AcaCustomDomain[];
   /** optional callback invoked at each provisioning step (for system logs) */
   log?: (level: "info" | "warn" | "error", msg: string, meta?: Record<string, unknown>) => void;
+  /** optional structured progress callback for polling UIs */
+  progress?: (update: DeployProgressState) => void | Promise<void>;
 }
 
 export interface DeployResult {
@@ -256,10 +635,9 @@ export interface DeployResult {
   provisioningState: string;
 }
 
-interface AcaCustomDomain {
-  name: string;
-  bindingType?: string;
-  certificateId?: string;
+export interface ManagedEnvironmentInfo {
+  staticIp: string | null;
+  provisioningState: string;
 }
 
 interface AcaSecret {
@@ -319,6 +697,14 @@ function mergeAcaEnvVars(
  */
 export async function upsertContainerApp(input: DeployFunctionInput): Promise<DeployResult> {
   const log = input.log ?? (() => {});
+  const reportProgress = async (update: DeployProgressState) => {
+    if (!input.progress) return;
+    try {
+      await Promise.resolve(input.progress(update));
+    } catch (error) {
+      console.error("[aca.progress] failed", error);
+    }
+  };
   const e = azureEnv();
   const url = containerAppResourceUrl(input.containerAppName);
 
@@ -375,13 +761,33 @@ export async function upsertContainerApp(input: DeployFunctionInput): Promise<De
   const startupPeriodSeconds = input.startupPeriodSeconds ?? 5;
 
   log("info", "Ensuring Azure infra (resource group + managed environment)", { env: e.environment });
+  await reportProgress({
+    percent: 35,
+    step: "azure-infra",
+    message: "Ensuring Azure infra (resource group + managed environment)",
+    status: "provisioning",
+    meta: { env: e.environment, resourceGroup: e.resourceGroup },
+  });
   await ensureInfra();
   log("info", "Infra ready", { rg: e.resourceGroup, env: e.environment });
+  await reportProgress({
+    percent: 45,
+    step: "azure-infra-ready",
+    message: "Infra ready",
+    status: "provisioning",
+    meta: { rg: e.resourceGroup, env: e.environment },
+  });
 
   // Read existing app state before any delete/recreate path so we can preserve
   // custom domains, env vars, and secrets that were configured outside the DB.
   const existing = await getContainerApp(input.containerAppName);
   const preservedCustomDomains: AcaCustomDomain[] = existing?.customDomainsRaw ?? [];
+  const incomingCustomDomains = input.customDomains ?? [];
+  const desiredCustomDomainNames = incomingCustomDomains.map((domain) => normalizeHostname(domain.name));
+  const mergedCustomDomains =
+    incomingCustomDomains.length > 0
+      ? mergeAcaCustomDomains(incomingCustomDomains, preservedCustomDomains)
+      : preservedCustomDomains;
   let preservedSecrets: AcaSecret[] = [];
   if (existing) {
     try {
@@ -398,6 +804,17 @@ export async function upsertContainerApp(input: DeployFunctionInput): Promise<De
     incomingEnvVars,
     new Set(mergedSecrets.map((secret) => normalizeAcaSecretName(secret.name))),
   );
+  await reportProgress({
+    percent: 55,
+    step: "template",
+    message: "Preparing Container App template",
+    status: "provisioning",
+    meta: {
+      containerAppName: input.containerAppName,
+      secrets: mergedSecrets.length,
+      envVars: mergedEnvVars.length,
+    },
+  });
 
   const body = {
     location: e.location,
@@ -416,12 +833,18 @@ export async function upsertContainerApp(input: DeployFunctionInput): Promise<De
       },
       template: {
         revisionSuffix,
+        ...(input.volumes?.length
+          ? { volumes: input.volumes }
+          : {}),
         containers: [
           {
             name: "main",
             image: containerImage,
             resources: { cpu, memory },
             env: mergedEnvVars,
+            ...(input.volumeMounts?.length
+              ? { volumeMounts: input.volumeMounts }
+              : {}),
             command: ["/bin/sh", "-c"],
             args: [startupScript],
             probes: [
@@ -443,14 +866,26 @@ export async function upsertContainerApp(input: DeployFunctionInput): Promise<De
             ],
           },
         ],
-        scale: { minReplicas: 1, maxReplicas: 3 },
+        scale: {
+          minReplicas: input.minReplicas ?? 1,
+          maxReplicas: input.maxReplicas ?? 3,
+        },
       },
     },
   };
 
-  if (preservedCustomDomains.length) {
-    log("info", "Preserving existing custom domains", { domains: preservedCustomDomains.map((d) => d.name) });
-    (body.properties.configuration.ingress as Record<string, unknown>).customDomains = preservedCustomDomains;
+  if (mergedCustomDomains.length) {
+    const mode = incomingCustomDomains.length > 0 ? "Applying custom domains" : "Preserving existing custom domains";
+    const domainNames = mergedCustomDomains.map((d) => d.name);
+    log("info", mode, { domains: domainNames });
+    await reportProgress({
+      percent: 60,
+      step: "custom-domains",
+      message: mode,
+      status: "provisioning",
+      meta: { domains: domainNames },
+    });
+    (body.properties.configuration.ingress as Record<string, unknown>).customDomains = mergedCustomDomains;
   }
 
   // If the container already exists with ingress disabled, Azure may silently ignore
@@ -459,6 +894,14 @@ export async function upsertContainerApp(input: DeployFunctionInput): Promise<De
   if (input.external) {
     if (existing && !existing.defaultFqdn) {
       log("warn", "Existing container app has no FQDN — recreating", { name: input.containerAppName });
+      await reportProgress({
+        percent: 65,
+        step: "recreate",
+        message: "Recreating Container App to enable external ingress",
+        level: "warn",
+        status: "provisioning",
+        meta: { name: input.containerAppName },
+      });
       await deleteContainerApp(input.containerAppName);
       const delDeadline = Date.now() + 60_000;
       while (Date.now() < delDeadline) {
@@ -470,10 +913,25 @@ export async function upsertContainerApp(input: DeployFunctionInput): Promise<De
   }
 
   log("info", "PUT container app", { name: input.containerAppName, image: containerImage });
+  await reportProgress({
+    percent: 70,
+    step: "put",
+    message: "PUT container app",
+    status: "provisioning",
+    meta: { name: input.containerAppName, image: containerImage },
+  });
   const res = await armFetch(url, { method: "PUT", body: JSON.stringify(body) });
   if (!res.ok) {
     const text = await res.text();
     log("error", `Azure PUT failed ${res.status}`, { body: text.slice(0, 2000) });
+    await reportProgress({
+      percent: 90,
+      step: "put-failed",
+      message: `Azure PUT failed ${res.status}`,
+      level: "error",
+      status: "failed",
+      meta: { body: text.slice(0, 2000) },
+    });
     throw new Error(`Azure deploy failed (${res.status}): ${text}`);
   }
   const data = (await res.json()) as {
@@ -486,30 +944,110 @@ export async function upsertContainerApp(input: DeployFunctionInput): Promise<De
   let customDomains = (data.properties?.configuration?.ingress?.customDomains ?? []).map((d) => d.name);
   let state = data.properties?.provisioningState ?? "Unknown";
   log("info", "PUT accepted — polling for FQDN", { state, defaultFqdn, customDomains });
+  await reportProgress({
+    percent: 80,
+    step: "polling",
+    message: "PUT accepted — polling for FQDN",
+    status: "provisioning",
+    meta: { state, defaultFqdn, customDomains },
+  });
 
   const deadline = Date.now() + 120_000;
-  while ((!defaultFqdn || state === "InProgress" || state === "Creating" || state === "Updating") && Date.now() < deadline) {
+  const wantsCustomDomains = desiredCustomDomainNames.length > 0;
+  const hasDesiredCustomDomains = () =>
+    !wantsCustomDomains ||
+    desiredCustomDomainNames.every((name) => customDomains.some((current) => normalizeHostname(current) === name));
+  while (
+    (
+      !defaultFqdn ||
+      state === "InProgress" ||
+      state === "Creating" ||
+      state === "Updating" ||
+      (wantsCustomDomains && !hasDesiredCustomDomains())
+    ) &&
+    Date.now() < deadline
+  ) {
     await new Promise((r) => setTimeout(r, 2500));
     const info = await getContainerApp(input.containerAppName);
     if (!info) break;
     defaultFqdn = info.defaultFqdn;
     customDomains = info.customDomains;
     state = info.provisioningState;
-    if (defaultFqdn && (state === "Succeeded" || state === "Unknown")) break;
+    await reportProgress({
+      percent: defaultFqdn ? 90 : 82,
+      step: "polling",
+      message: `Azure provisioning ${state}`,
+      status: "provisioning",
+      meta: { state, defaultFqdn, customDomains },
+    });
+    if (defaultFqdn && (state === "Succeeded" || state === "Unknown") && hasDesiredCustomDomains()) break;
     if (state === "Failed" || state === "Canceled") {
       log("error", `Azure provisioning ${state}`, { name: input.containerAppName });
+      await reportProgress({
+        percent: 95,
+        step: "failed",
+        message: `Azure provisioning ${state}`,
+        level: "error",
+        status: "failed",
+        meta: { name: input.containerAppName, state },
+      });
       throw new Error(`Azure provisioning ${state.toLowerCase()} for ${input.containerAppName}`);
     }
   }
 
   if (!defaultFqdn) {
     log("error", "No FQDN assigned after polling", { state });
+    await reportProgress({
+      percent: 95,
+      step: "no-fqdn",
+      message: "No FQDN assigned after polling",
+      level: "error",
+      status: "failed",
+      meta: { state },
+    });
     throw new Error(`Azure no asignó FQDN público al contenedor "${input.containerAppName}" (estado: ${state}). Verifica en el portal que "Entrada (Ingress)" esté habilitada con tráfico externo; si no, borra el container app desde Azure y vuelve a desplegar.`);
   }
 
   // Prefer custom domain if configured — that becomes the canonical URL.
-  const preferredFqdn = customDomains[0] ?? defaultFqdn;
+  if (wantsCustomDomains && !hasDesiredCustomDomains()) {
+    log("error", "Custom domains were not bound before timeout", {
+      requested: desiredCustomDomainNames,
+      current: customDomains,
+      state,
+    });
+    await reportProgress({
+      percent: 95,
+      step: "custom-domain-timeout",
+      message: "Custom domains were not bound before timeout",
+      level: "error",
+      status: "failed",
+      meta: {
+        requested: desiredCustomDomainNames,
+        current: customDomains,
+        state,
+      },
+    });
+    throw new Error(
+      `Custom domain binding timed out for ${input.containerAppName}. Requested: ${desiredCustomDomainNames.join(", ")}`,
+    );
+  }
+  const hasActiveCustomDomainBinding = mergedCustomDomains.some((domain) => {
+    const bindingType = (domain.bindingType ?? "").trim().toLowerCase();
+    return Boolean(domain.certificateId) || (bindingType && bindingType !== "disabled");
+  });
+  const preferredFqdn = hasActiveCustomDomainBinding && wantsCustomDomains
+    ? desiredCustomDomainNames.find((name) => customDomains.some((current) => normalizeHostname(current) === name)) ??
+      customDomains[0] ??
+      defaultFqdn
+    : defaultFqdn;
   log("info", "Container app ready", { preferredFqdn, defaultFqdn, customDomains, state });
+  await reportProgress({
+    percent: 95,
+    step: "ready",
+    message: "Container app ready",
+    status: "provisioning",
+    meta: { preferredFqdn, defaultFqdn, customDomains, state },
+  });
 
   return {
     name: input.containerAppName,
@@ -524,6 +1062,7 @@ export interface ContainerAppInfo {
   /** Preferred hostname (custom domain first, fallback to default ACA FQDN). */
   fqdn: string | null;
   defaultFqdn: string | null;
+  customDomainVerificationId: string | null;
   customDomains: string[];
   customDomainsRaw: AcaCustomDomain[];
   environmentVariables: AcaEnvVar[];
@@ -540,6 +1079,7 @@ export async function getContainerApp(name: string): Promise<ContainerAppInfo | 
     properties?: {
       provisioningState?: string;
       runningStatus?: string;
+      customDomainVerificationId?: string | null;
       configuration?: { ingress?: { fqdn?: string; customDomains?: AcaCustomDomain[] } };
       template?: { containers?: Array<{ env?: AcaEnvVar[] }> };
     };
@@ -551,6 +1091,7 @@ export async function getContainerApp(name: string): Promise<ContainerAppInfo | 
   return {
     fqdn: customDomains[0] ?? defaultFqdn,
     defaultFqdn,
+    customDomainVerificationId: data.properties?.customDomainVerificationId ?? null,
     customDomains,
     customDomainsRaw,
     environmentVariables,
@@ -595,6 +1136,7 @@ async function waitForContainerAppRunningStatus(
   return lastInfo ?? (await getContainerApp(name)) ?? {
     fqdn: null,
     defaultFqdn: null,
+    customDomainVerificationId: null,
     customDomains: [],
     customDomainsRaw: [],
     environmentVariables: [],

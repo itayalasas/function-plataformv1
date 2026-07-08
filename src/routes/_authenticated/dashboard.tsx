@@ -21,6 +21,7 @@ import {
   Dialog, DialogContent, DialogHeader, DialogTitle, DialogTrigger, DialogFooter,
 } from "@/components/ui/dialog";
 import { Badge } from "@/components/ui/badge";
+import { Progress } from "@/components/ui/progress";
 import { ScrollArea } from "@/components/ui/scroll-area";
 
 import { useAuth } from "@/hooks/use-auth";
@@ -616,6 +617,12 @@ function ProjectView({
             <span className={`h-2 w-2 rounded-full ${appStatusMeta.dotClass}`} />
             {appStatusMeta.label}
           </Badge>
+          {projectAppStatus.data?.publicHostnameStatus === "pending" && (
+            <Badge className="gap-1 border border-amber-500/30 bg-amber-500/10 text-amber-500">
+              <span className="h-2 w-2 rounded-full bg-amber-500 animate-pulse" />
+              dominio pendiente
+            </Badge>
+          )}
           <span className="text-xs text-muted-foreground">
             {projectAppStatus.data?.containerAppName
               ? projectAppStatus.data.containerAppName
@@ -990,6 +997,16 @@ function DeploysTabPanel({ projectId }: { projectId: string }) {
                       <div><span className="text-muted-foreground">Iniciado:</span> {ts.toLocaleString()}</div>
                       <div><span className="text-muted-foreground">Finalizado:</span> {finished?.toLocaleString() ?? "—"}</div>
                     </div>
+                    <div className="space-y-1 pb-2">
+                      <div className="flex items-center justify-between text-[11px]">
+                        <span className="text-muted-foreground">Progreso</span>
+                        <span className="font-mono">{d.progress_percent ?? 0}%</span>
+                      </div>
+                      <Progress value={d.progress_percent ?? 0} className="h-2" />
+                      <div className="text-[11px] text-muted-foreground">
+                        {d.progress_message ?? d.progress_step ?? "Sin progreso registrado"}
+                      </div>
+                    </div>
                     {d.error && (
                       <div>
                         <div className="text-[10px] uppercase text-muted-foreground mb-1">Error</div>
@@ -1267,9 +1284,14 @@ function FunctionView({
   const [aiResult, setAiResult] = useState<string>("");
   const [renameOpen, setRenameOpen] = useState(false);
   const [renamePath, setRenamePath] = useState("");
+  const [deploying, setDeploying] = useState(false);
 
   const files = useQuery({ queryKey: ["files", functionId], queryFn: () => lfi({ data: { functionId } }) });
-  const deployments = useQuery({ queryKey: ["deps", projectId], queryFn: () => ld({ data: { projectId } }) });
+  const deployments = useQuery({
+    queryKey: ["deps", projectId],
+    queryFn: () => ld({ data: { projectId } }),
+    refetchInterval: deploying ? 1000 : 15000,
+  });
 
   const fileEntries = useMemo(
     () => (files.data ?? []).filter((file) => file.kind !== "dir"),
@@ -1309,6 +1331,31 @@ function FunctionView({
       : runtime.id === "node" ? "api"
       : "_shared";
   const hasDeployments = (deployments.data?.length ?? 0) > 0;
+  const activeDeployment = useMemo(() => {
+    const items = deployments.data ?? [];
+    return (
+      items.find((d: any) => {
+        const status = String(d.status ?? "").toLowerCase();
+        return status === "building" || status === "provisioning";
+      }) ?? items[0] ?? null
+    );
+  }, [deployments.data]);
+  const activeDeploymentStatus = String(activeDeployment?.status ?? "").toLowerCase();
+  const showDeployProgress = deploying || activeDeploymentStatus === "building" || activeDeploymentStatus === "provisioning";
+  const deployProgressValue = Math.max(
+    0,
+    Math.min(
+      100,
+      Number.isFinite(Number(activeDeployment?.progress_percent))
+        ? Number(activeDeployment?.progress_percent)
+        : deploying
+          ? 5
+          : 0,
+    ),
+  );
+  const deployProgressMessage =
+    activeDeployment?.progress_message ??
+    (deploying ? "Preparando despliegue..." : null);
   const newFilePlaceholder = createBasePath ? `${createBasePath}/${createFileTail}` : createFileTail;
   const newDirPlaceholder = createBasePath ? `${createBasePath}/${createDirTail}` : createDirTail;
 
@@ -1385,6 +1432,9 @@ function FunctionView({
       }
       return dep({ data: { projectId } });
     },
+    onMutate: () => {
+      setDeploying(true);
+    },
     onSuccess: (r) => {
       setDirty(false); setValidation({ ok: true });
       toast.success(`${hasDeployments ? "Redeploy" : "Deploy"} completado v${r.version}`);
@@ -1393,6 +1443,9 @@ function FunctionView({
       qc.invalidateQueries({ queryKey: ["dashboard"] });
     },
     onError: (e) => toast.error(e instanceof Error ? e.message : "Error de deploy"),
+    onSettled: () => {
+      setDeploying(false);
+    },
   });
 
   const aiMut = useMutation({
@@ -1682,6 +1735,21 @@ function FunctionView({
             </Button>
           </div>
         </div>
+        {showDeployProgress && (
+          <div className="border-b border-border bg-card/30 px-4 py-3 space-y-2">
+            <div className="flex items-center justify-between gap-2 text-xs">
+              <span className="font-mono uppercase text-muted-foreground">Provisioning</span>
+              <span className="font-mono text-muted-foreground">{deployProgressValue}%</span>
+            </div>
+            <Progress value={deployProgressValue} className="h-2" />
+            <div className="flex items-center justify-between gap-3 text-xs text-muted-foreground">
+              <span className="truncate">{deployProgressMessage ?? "Esperando provisioning de la container app..."}</span>
+              <span className="font-mono uppercase">
+                {activeDeployment?.progress_step ? String(activeDeployment.progress_step) : activeDeploymentStatus || "deploy"}
+              </span>
+            </div>
+          </div>
+        )}
         {current ? (
           <div className="flex-1 min-h-0 overflow-hidden bg-editor flex flex-col" data-color-mode="dark">
             {isJavaProject && current.path.toLowerCase().endsWith(".java") && (

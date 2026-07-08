@@ -1,5 +1,13 @@
 import { sql, ensureSchema, logEvent } from "../neon/db.server.ts";
-import { upsertContainerApp, sanitizeAcaName } from "../azure/aca.server.ts";
+import {
+  createManagedCertificate,
+  ensurePersistentStorageMount,
+  getContainerApp,
+  getManagedEnvironmentInfo,
+  getManagedCertificate,
+  upsertContainerApp,
+  sanitizeAcaName,
+} from "../azure/aca.server.ts";
 import { RUNNER_SOURCE } from "../runner-source.generated.ts";
 import { getRuntimeConfig, type RuntimeId } from "../runtimes/index.ts";
 import { NODE_RUNNER_SOURCE } from "../runtimes/runner-node.ts";
@@ -11,6 +19,423 @@ export type DeployProgressLogger = (
   message: string,
   meta?: Record<string, unknown>,
 ) => void;
+
+export type DeploymentProgressUpdate = {
+  percent: number;
+  step: string;
+  message: string;
+  level?: "info" | "warn" | "error";
+  status?: "building" | "provisioning" | "live" | "failed";
+  meta?: Record<string, unknown>;
+};
+
+export type DeploymentProgressReporter = (
+  update: DeploymentProgressUpdate,
+) => void | Promise<void>;
+
+export const DEFAULT_STORAGE_MOUNT_PATH =
+  process.env.VORTEX_DEFAULT_STORAGE_MOUNT_PATH?.trim() || "/data";
+
+export interface ProjectDeploymentProfile {
+  cpu?: number;
+  memory?: string;
+  minReplicas?: number;
+  maxReplicas?: number;
+  storageMountPath?: string | null;
+  publicDomain?: ProjectPublicDomainConfig | null;
+}
+
+export interface ProjectPublicDomainConfig {
+  domain: string;
+  subdomain?: string | null;
+  ttl?: number;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function asNumber(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+function asString(value: unknown): string | undefined {
+  return typeof value === "string" && value.trim() ? value.trim() : undefined;
+}
+
+export function normalizeProjectDeploymentProfile(raw: unknown): ProjectDeploymentProfile {
+  if (!isRecord(raw)) return {};
+  const profile: ProjectDeploymentProfile = {};
+  const cpu = asNumber(raw.cpu);
+  if (cpu !== undefined) profile.cpu = cpu;
+  const memory = asString(raw.memory);
+  if (memory) profile.memory = memory;
+  const minReplicas = asNumber(raw.minReplicas);
+  if (minReplicas !== undefined) profile.minReplicas = Math.max(1, Math.floor(minReplicas));
+  const maxReplicas = asNumber(raw.maxReplicas);
+  if (maxReplicas !== undefined) profile.maxReplicas = Math.max(1, Math.floor(maxReplicas));
+  const storageMountPath = asString(raw.storageMountPath);
+  if (storageMountPath) profile.storageMountPath = storageMountPath;
+  const publicDomain = normalizePublicDomainConfig(
+    isRecord(raw.publicDomain) ? (raw.publicDomain as unknown as ProjectPublicDomainConfig) : null,
+  );
+  if (publicDomain) profile.publicDomain = publicDomain;
+  return profile;
+}
+
+export function applyDefaultStorageMountPath(
+  profile: ProjectDeploymentProfile,
+): ProjectDeploymentProfile {
+  if (profile.storageMountPath) return profile;
+  return { ...profile, storageMountPath: DEFAULT_STORAGE_MOUNT_PATH };
+}
+
+function normalizeHostnameLabel(input: string | null | undefined): string | null {
+  const raw = input?.trim().toLowerCase().replace(/\.+$/g, "");
+  if (!raw) return null;
+  return raw;
+}
+
+function composePublicHostname(domain: string, subdomain?: string | null): string {
+  const normalizedDomain = normalizeHostnameLabel(domain);
+  if (!normalizedDomain) {
+    throw new Error("Public domain is required");
+  }
+  const normalizedSubdomain = normalizeHostnameLabel(subdomain);
+  return normalizedSubdomain ? `${normalizedSubdomain}.${normalizedDomain}` : normalizedDomain;
+}
+
+function buildPublicDomainCertificateName(publicHostname: string): string {
+  return sanitizeAcaName(`cert-${publicHostname.replace(/\./g, "-")}`, "cert");
+}
+
+type StorageArtifacts = {
+  volumes?: Array<{
+    name: string;
+    storageType?: "EmptyDir" | "AzureFile" | "Secret" | "NfsAzureFile";
+    storageName?: string;
+    mountOptions?: string;
+  }>;
+  volumeMounts?: Array<{
+    volumeName: string;
+    mountPath: string;
+    subPath?: string;
+  }>;
+};
+
+async function resolveStorageArtifacts(input: {
+  projectId: string;
+  containerAppName: string;
+  storageMountPath: string;
+  log?: DeployProgressLogger;
+}): Promise<StorageArtifacts> {
+  if (!input.storageMountPath) return {};
+  if (input.storageMountPath === "/data") {
+    return {
+      volumes: [
+        {
+          name: "data",
+          storageType: "EmptyDir",
+        },
+      ],
+      volumeMounts: [
+        {
+          volumeName: "data",
+          mountPath: input.storageMountPath,
+        },
+      ],
+    };
+  }
+
+  const storage = await ensurePersistentStorageMount({
+    projectId: input.projectId,
+    containerAppName: input.containerAppName,
+    mountPath: input.storageMountPath,
+    log: input.log ?? (() => {}),
+  });
+  return {
+    volumes: storage.volumes,
+    volumeMounts: storage.volumeMounts,
+  };
+}
+
+export async function reconcilePublicDomainBinding(input: {
+  projectId: string;
+  ownerId: string;
+  progress?: DeploymentProgressReporter;
+  log?: DeployProgressLogger;
+}): Promise<{
+  publicHostname: string | null;
+  certificateState: string | null;
+  status: "noop" | "pending" | "ready";
+  fqdn: string | null;
+  defaultFqdn: string | null;
+  customDomains: string[];
+} | null> {
+  try {
+    await ensureSchema();
+    const s = sql();
+    const rows = (await s`
+      SELECT id, slug, runtime, container_app_name, fqdn, deployment_profile
+      FROM projects
+      WHERE id = ${input.projectId} AND owner_id = ${input.ownerId}
+      LIMIT 1
+    `) as Array<{
+      id: string;
+      slug: string;
+      runtime: string | null;
+      container_app_name: string | null;
+      fqdn: string | null;
+      deployment_profile: unknown;
+    }>;
+    const project = rows[0];
+    if (!project?.container_app_name) return null;
+
+    const deploymentProfile = normalizeProjectDeploymentProfile(project.deployment_profile);
+    const publicDomainConfig = deploymentProfile.publicDomain ? normalizePublicDomainConfig(deploymentProfile.publicDomain) : null;
+    if (!publicDomainConfig) return null;
+
+    const publicHostname = composePublicHostname(publicDomainConfig.domain, publicDomainConfig.subdomain);
+    const runtimeId = (project.runtime ?? "deno") as RuntimeId;
+    const runtime = getRuntimeConfig(runtimeId);
+    let current = await getContainerApp(project.container_app_name);
+    if (!current) {
+      return {
+        publicHostname,
+        certificateState: null,
+        status: "noop",
+        fqdn: null,
+        defaultFqdn: null,
+        customDomains: [],
+      };
+    }
+
+    const currentCustomDomain = current.customDomainsRaw.find(
+      (domain) => normalizeHostnameLabel(domain.name) === publicHostname,
+    );
+    const hasActiveCustomDomain = Boolean(
+      currentCustomDomain &&
+        (Boolean(currentCustomDomain.certificateId) ||
+          ((currentCustomDomain.bindingType ?? "").trim().toLowerCase() !== "disabled")),
+    );
+
+    const certificateName = buildPublicDomainCertificateName(publicHostname);
+    const certificate = await getManagedCertificate(certificateName) ?? await createManagedCertificate({
+      hostname: publicHostname,
+      validationMethod: publicDomainConfig.subdomain ? "CNAME" : "HTTP",
+      certificateName,
+      waitForCompletionMs: 0,
+      allowPending: true,
+    });
+
+    if (!certificate.pending && !hasActiveCustomDomain) {
+      const artifacts = await resolveStorageArtifacts({
+        projectId: project.id,
+        containerAppName: project.container_app_name,
+        storageMountPath: deploymentProfile.storageMountPath?.trim() || "",
+        log: input.log,
+      });
+      const result = await upsertContainerApp({
+        containerAppName: project.container_app_name,
+        external: true,
+        targetPort: runtime.port,
+        image: runtime.image,
+        startupScript: runtime.startupScript,
+        cpu: deploymentProfile.cpu ?? runtime.cpu,
+        memory: deploymentProfile.memory ?? runtime.memory,
+        minReplicas: deploymentProfile.minReplicas ?? 1,
+        maxReplicas: deploymentProfile.maxReplicas ?? 3,
+        volumes: artifacts.volumes,
+        volumeMounts: artifacts.volumeMounts,
+        healthPath: runtime.healthPath,
+        startupInitialDelaySeconds: runtime.startupInitialDelaySeconds,
+        startupFailureThreshold: runtime.startupFailureThreshold,
+        startupPeriodSeconds: runtime.startupPeriodSeconds,
+        env: {},
+        secrets: {},
+        customDomains: [
+          {
+            name: publicHostname,
+            bindingType: "SniEnabled",
+            certificateId: certificate.id,
+          },
+        ],
+        log: input.log,
+      });
+      await s`
+        UPDATE projects
+        SET fqdn = ${result.fqdn}, last_deployed_at = now()
+        WHERE id = ${project.id}
+      `;
+      await s`
+        UPDATE deployments
+        SET status = 'live', fqdn = ${result.fqdn}, finished_at = COALESCE(finished_at, now()), updated_at = now()
+        WHERE project_id = ${project.id} AND container_app_name = ${project.container_app_name} AND owner_id = ${input.ownerId}
+      `;
+      await s`
+        UPDATE functions
+        SET status = 'live', container_app_name = ${project.container_app_name}, fqdn = ${result.fqdn}, updated_at = now()
+        WHERE project_id = ${project.id} AND owner_id = ${input.ownerId}
+      `;
+      return {
+        publicHostname,
+        certificateState: certificate.provisioningState,
+        status: "ready",
+        fqdn: result.fqdn,
+        defaultFqdn: result.defaultFqdn,
+        customDomains: result.customDomains,
+      };
+    }
+
+    if (!certificate.pending && hasActiveCustomDomain && project.fqdn !== publicHostname) {
+      await s`
+        UPDATE projects
+        SET fqdn = ${publicHostname}, last_deployed_at = now()
+        WHERE id = ${project.id}
+      `;
+      await s`
+        UPDATE deployments
+        SET status = 'live', fqdn = ${publicHostname}, finished_at = COALESCE(finished_at, now()), updated_at = now()
+        WHERE project_id = ${project.id} AND container_app_name = ${project.container_app_name} AND owner_id = ${input.ownerId}
+      `;
+      await s`
+        UPDATE functions
+        SET status = 'live', container_app_name = ${project.container_app_name}, fqdn = ${publicHostname}, updated_at = now()
+        WHERE project_id = ${project.id} AND owner_id = ${input.ownerId}
+      `;
+      return {
+        publicHostname,
+        certificateState: certificate.provisioningState,
+        status: "ready",
+        fqdn: publicHostname,
+        defaultFqdn: current.defaultFqdn,
+        customDomains: current.customDomains,
+      };
+    }
+
+    if (certificate.pending && !currentCustomDomain) {
+      const artifacts = await resolveStorageArtifacts({
+        projectId: project.id,
+        containerAppName: project.container_app_name,
+        storageMountPath: deploymentProfile.storageMountPath?.trim() || "",
+        log: input.log,
+      });
+      await upsertContainerApp({
+        containerAppName: project.container_app_name,
+        external: true,
+        targetPort: runtime.port,
+        image: runtime.image,
+        startupScript: runtime.startupScript,
+        cpu: deploymentProfile.cpu ?? runtime.cpu,
+        memory: deploymentProfile.memory ?? runtime.memory,
+        minReplicas: deploymentProfile.minReplicas ?? 1,
+        maxReplicas: deploymentProfile.maxReplicas ?? 3,
+        volumes: artifacts.volumes,
+        volumeMounts: artifacts.volumeMounts,
+        healthPath: runtime.healthPath,
+        startupInitialDelaySeconds: runtime.startupInitialDelaySeconds,
+        startupFailureThreshold: runtime.startupFailureThreshold,
+        startupPeriodSeconds: runtime.startupPeriodSeconds,
+        env: {},
+        secrets: {},
+        customDomains: [
+          {
+            name: publicHostname,
+            bindingType: "Disabled",
+          },
+        ],
+        log: input.log,
+      });
+      current = (await getContainerApp(project.container_app_name)) ?? current;
+    }
+
+    return {
+      publicHostname,
+      certificateState: certificate.provisioningState,
+      status: certificate.pending ? "pending" : hasActiveCustomDomain ? "ready" : "noop",
+      fqdn: current.fqdn,
+      defaultFqdn: current.defaultFqdn,
+      customDomains: current.customDomains,
+    };
+  } catch (error) {
+    input.log?.("warn", "Public domain reconciliation skipped after error", {
+      projectId: input.projectId,
+      error: error instanceof Error ? error.message : String(error),
+    });
+    return null;
+  }
+}
+
+function normalizePublicDomainConfig(raw?: ProjectPublicDomainConfig | null): ProjectPublicDomainConfig | null {
+  if (!raw) return null;
+  const domain = normalizeHostnameLabel(raw.domain);
+  if (!domain) return null;
+  const subdomain = normalizeHostnameLabel(raw.subdomain);
+  const ttl = typeof raw.ttl === "number" && Number.isFinite(raw.ttl) ? Math.max(60, Math.floor(raw.ttl)) : 600;
+  return { domain, subdomain, ttl };
+}
+
+function resolveDnsApiBaseUrl(): string {
+  const candidates = [
+    process.env.SENDCRAFT_DNS_API_BASE_URL,
+    process.env.SENDCRAFT_DNS_API_URL,
+  ];
+  for (const candidate of candidates) {
+    const normalized = candidate?.trim();
+    if (!normalized) continue;
+    try {
+      return new URL(normalized).origin;
+    } catch {
+      // ignore invalid override and keep falling back
+    }
+  }
+  return "https://api.sendcraft.net";
+}
+
+function isRetryableCustomHostnameValidationError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return /InvalidCustomHostNameValidation|TXT record .* was not found|custom hostname validation/i.test(message);
+}
+
+async function createDnsRecord(input: {
+  domain: string;
+  subdomain: string;
+  type: "A" | "CNAME" | "TXT";
+  value: string;
+  ttl?: number;
+}): Promise<unknown> {
+  const url = new URL("/create-subdominios", resolveDnsApiBaseUrl());
+  const response = await fetch(url, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({
+      domain: input.domain,
+      subdomain: input.subdomain,
+      type: input.type,
+      value: input.value,
+      ttl: input.ttl ?? 600,
+    }),
+  });
+  const text = await response.text();
+  let parsed: unknown = null;
+  if (text) {
+    try {
+      parsed = JSON.parse(text);
+    } catch {
+      parsed = text;
+    }
+  }
+  if (!response.ok) {
+    throw new Error(`DNS API error (${response.status}): ${text || "empty response"}`);
+  }
+  if (parsed && typeof parsed === "object" && "success" in parsed && (parsed as { success?: boolean }).success === false) {
+    const result = parsed as { error?: string; details?: string };
+    throw new Error(result.details ?? result.error ?? "DNS API reported failure");
+  }
+  return parsed;
+}
 
 function normalizeBaseUrl(input: string | null | undefined): string | null {
   const raw = input?.trim();
@@ -116,6 +541,8 @@ function buildLoggedDenoRunnerSource(source: string): string {
     '    console.error("[runner] failed to send runtime log:", err);',
     '  }',
     '}',
+    '',
+    'const sendRuntimeLog = persistInvocationLog;',
   ].join("\n");
 
   source = source.replace(
@@ -231,6 +658,9 @@ export interface DeployProjectResult {
   customDomains: string[];
   version: number;
   runtime: string;
+  publicHostname: string | null;
+  publicHostnameStatus: "none" | "pending" | "ready";
+  certificateState: string | null;
 }
 
 /**
@@ -241,31 +671,73 @@ export async function deployProjectById({
   projectId,
   ownerId,
   platformBaseUrl,
+  publicDomain,
   progress,
+  progressReporter,
 }: {
   projectId: string;
   ownerId: string;
   platformBaseUrl?: string | null;
+  publicDomain?: ProjectPublicDomainConfig | null;
   progress?: DeployProgressLogger;
+  progressReporter?: DeploymentProgressReporter;
 }): Promise<DeployProjectResult> {
   await ensureSchema();
   const s = sql();
   const projs =
-    (await s`SELECT id, slug, admin_token, log_token, runtime FROM projects WHERE id = ${projectId} AND owner_id = ${ownerId}`) as Array<{
+    (await s`SELECT id, slug, admin_token, log_token, runtime, deployment_profile FROM projects WHERE id = ${projectId} AND owner_id = ${ownerId}`) as Array<{
       id: string;
       slug: string;
       admin_token: string | null;
       log_token: string | null;
       runtime: string | null;
+      deployment_profile: unknown;
     }>;
   if (!projs[0]) throw new Error("Project not found");
   const proj = projs[0];
   const runtimeId = (proj.runtime ?? "deno") as RuntimeId;
   const runtime = getRuntimeConfig(runtimeId);
+  const deploymentProfile = normalizeProjectDeploymentProfile(proj.deployment_profile);
+  const cpu = deploymentProfile.cpu ?? runtime.cpu;
+  const memory = deploymentProfile.memory ?? runtime.memory;
+  const minReplicas = deploymentProfile.minReplicas ?? 1;
+  const maxReplicas = deploymentProfile.maxReplicas ?? 3;
+  const storageMountPath = deploymentProfile.storageMountPath?.trim() || "";
+  const emitDeployLog: DeployProgressLogger = (level, message, meta) => {
+    progress?.(level, message, meta);
+    void logEvent(proj.id, ownerId, level, "azure", message, meta);
+  };
+  const publicDomainConfig = normalizePublicDomainConfig(publicDomain ?? deploymentProfile.publicDomain ?? null);
+  const publicHostname = publicDomainConfig
+    ? composePublicHostname(publicDomainConfig.domain, publicDomainConfig.subdomain)
+    : null;
   progress?.("info", "Preparando deploy del proyecto", {
     projectId: proj.id,
     runtime: runtimeId,
     projectSlug: proj.slug,
+    cpu,
+    memory,
+    minReplicas,
+    maxReplicas,
+    storageMountPath: storageMountPath || null,
+    publicHostname,
+  });
+  await persistProgress({
+    percent: 5,
+    step: "queued",
+    message: "Preparando deploy del proyecto",
+    status: "building",
+    meta: {
+      projectId: proj.id,
+      runtime: runtimeId,
+      projectSlug: proj.slug,
+      cpu,
+      memory,
+      minReplicas,
+      maxReplicas,
+      storageMountPath: storageMountPath || null,
+      publicHostname,
+    },
   });
 
   // Generate / reuse a per-project admin token (used for /__validate)
@@ -287,6 +759,17 @@ export async function deployProjectById({
     progress?.("warn", "Runtime logs disabled: missing platform base URL", {
       projectId: proj.id,
       runtime: runtimeId,
+    });
+    await persistProgress({
+      percent: 10,
+      step: "platform-url-missing",
+      message: "Runtime logs disabled: missing platform base URL",
+      level: "warn",
+      status: "building",
+      meta: {
+        projectId: proj.id,
+        runtime: runtimeId,
+      },
     });
   }
 
@@ -318,12 +801,142 @@ export async function deployProjectById({
     }>;
   const version = verRows[0].v;
   const containerAppName = sanitizeAcaName(`proj-${proj.slug}-${proj.id.slice(0, 6)}`, "proj");
-
   const depRows =
     (await s`INSERT INTO deployments (project_id, owner_id, version, container_app_name, status, runtime) VALUES (${proj.id}, ${ownerId}, ${version}, ${containerAppName}, 'provisioning', ${runtimeId}) RETURNING id`) as Array<{
       id: string;
     }>;
   const deploymentId = depRows[0].id;
+  const useEphemeralDefaultStorage = storageMountPath === "/data";
+  const usePersistentStorage = Boolean(storageMountPath && !useEphemeralDefaultStorage);
+  let volumes:
+    | Array<{
+        name: string;
+        storageType?: "EmptyDir" | "AzureFile" | "Secret" | "NfsAzureFile";
+        storageName?: string;
+        mountOptions?: string;
+      }>
+    | undefined;
+  let volumeMounts:
+    | Array<{
+        volumeName: string;
+        mountPath: string;
+        subPath?: string;
+      }>
+    | undefined;
+  if (storageMountPath) {
+    if (useEphemeralDefaultStorage) {
+      emitDeployLog("info", "Using ephemeral default /data mount", {
+        projectId: proj.id,
+        runtime: runtimeId,
+        projectSlug: proj.slug,
+        storageMountPath,
+      });
+      await persistProgress({
+        percent: 30,
+        step: "storage-ephemeral",
+        message: "Using ephemeral /data mount",
+        status: "building",
+        meta: {
+          projectId: proj.id,
+          runtime: runtimeId,
+          projectSlug: proj.slug,
+          storageMountPath,
+        },
+      });
+      volumes = [
+        {
+          name: "data",
+          storageType: "EmptyDir",
+        },
+      ];
+      volumeMounts = [
+        {
+          volumeName: "data",
+          mountPath: storageMountPath,
+        },
+      ];
+    } else if (usePersistentStorage) {
+      emitDeployLog("info", "Provisioning persistent project storage", {
+        projectId: proj.id,
+        runtime: runtimeId,
+        projectSlug: proj.slug,
+        storageMountPath,
+      });
+      await persistProgress({
+        percent: 30,
+        step: "storage",
+        message: "Provisioning persistent project storage",
+        status: "building",
+        meta: {
+          projectId: proj.id,
+          runtime: runtimeId,
+          projectSlug: proj.slug,
+          storageMountPath,
+        },
+      });
+      const storage = await ensurePersistentStorageMount({
+        projectId: proj.id,
+        containerAppName,
+        mountPath: storageMountPath,
+        log: emitDeployLog,
+      });
+      volumes = storage.volumes;
+      volumeMounts = storage.volumeMounts;
+      await persistProgress({
+        percent: 32,
+        step: "storage-ready",
+        message: "Persistent project storage ready",
+        status: "building",
+        meta: {
+          projectId: proj.id,
+          runtime: runtimeId,
+          projectSlug: proj.slug,
+          storageMountPath,
+          storageName: storage.storageName,
+        },
+      });
+    }
+  }
+
+  async function persistProgress(update: DeploymentProgressUpdate): Promise<void> {
+    try {
+      const percent = Math.max(0, Math.min(100, Math.round(update.percent)));
+      const status =
+        update.status ??
+        (update.level === "error" ? "failed" : percent >= 100 ? "live" : percent >= 25 ? "provisioning" : "building");
+      const progressMeta = {
+        ...(update.meta ?? {}),
+        progressPercent: percent,
+        progressStep: update.step,
+        progressStatus: status,
+        progressMessage: update.message,
+      };
+      await s`
+        UPDATE deployments
+        SET
+          status = ${status},
+          progress_percent = ${percent},
+          progress_step = ${update.step},
+          progress_message = ${update.message},
+          progress_meta = ${JSON.stringify(progressMeta)}::jsonb,
+          updated_at = now()
+        WHERE id = ${deploymentId}
+      `;
+      if (status === "live" || status === "failed") {
+        await s`UPDATE deployments SET finished_at = now(), updated_at = now() WHERE id = ${deploymentId}`;
+      }
+      if (progressReporter) {
+        await progressReporter({
+          ...update,
+          status,
+          meta: progressMeta,
+        });
+      }
+    } catch (error) {
+      console.error("[deployProgress] failed", error);
+    }
+  }
+
   const runnerScript = getRunnerScript(runtimeId);
 
   // For non-Deno runtimes, bundle ALL function files for this project into FILES_JSON.
@@ -363,6 +976,18 @@ export async function deployProjectById({
     containerAppName,
     runtime: runtimeId,
     version,
+    publicHostname,
+  });
+  await persistProgress({
+    percent: 20,
+    step: "preparing",
+    message: `Iniciando deploy v${version}`,
+    status: "building",
+    meta: {
+      containerAppName,
+      runtime: runtimeId,
+      version,
+    },
   });
 
   try {
@@ -393,61 +1018,361 @@ export async function deployProjectById({
       baseEnv.FILES_JSON = filesJson;
     }
 
-    const result = await upsertContainerApp({
+    const publicDomainInitialBinding = publicHostname
+      ? [
+          {
+            name: publicHostname,
+            bindingType: "Disabled",
+          },
+        ]
+      : undefined;
+
+    let result = await upsertContainerApp({
       containerAppName,
       external: true,
       targetPort: runtime.port,
       image: runtime.image,
       startupScript: runtime.startupScript,
-      cpu: runtime.cpu,
-      memory: runtime.memory,
+      cpu,
+      memory,
+      minReplicas,
+      maxReplicas,
+      volumes,
+      volumeMounts,
       healthPath: runtime.healthPath,
       startupInitialDelaySeconds: runtime.startupInitialDelaySeconds,
       startupFailureThreshold: runtime.startupFailureThreshold,
       startupPeriodSeconds: runtime.startupPeriodSeconds,
       env: baseEnv,
       secrets,
-      log: (level, message, meta) => {
-        progress?.(level, message, meta);
-        // Fire-and-forget: don't block the deploy on a log write failure.
-        void logEvent(proj.id, ownerId, level, "azure", message, meta);
-      },
+      progress: persistProgress,
+      log: emitDeployLog,
     });
 
-    await s`UPDATE deployments SET status = 'live', fqdn = ${result.fqdn} WHERE id = ${deploymentId}`;
-    await s`UPDATE projects SET container_app_name = ${containerAppName}, fqdn = ${result.fqdn}, last_deployed_at = now() WHERE id = ${proj.id}`;
-    await s`UPDATE functions SET status = 'live', container_app_name = ${containerAppName}, fqdn = ${result.fqdn}, updated_at = now() WHERE project_id = ${proj.id}`;
+    let certificateState: string | null = null;
+    let certificatePending = false;
 
-    const usingCustom = result.customDomains.length > 0;
+    if (publicDomainConfig && publicHostname) {
+      let verificationId = "";
+      for (let attempt = 0; attempt < 10; attempt += 1) {
+        const verificationInfo = await getContainerApp(containerAppName);
+        verificationId = verificationInfo?.customDomainVerificationId?.trim() || "";
+        if (verificationId) break;
+        await new Promise((resolve) => setTimeout(resolve, 2000));
+      }
+      if (!verificationId) {
+        throw new Error(`Missing customDomainVerificationId for ${containerAppName}`);
+      }
+
+      const environmentInfo = await getManagedEnvironmentInfo();
+      if (!environmentInfo?.staticIp) {
+        throw new Error("Azure managed environment static IP is not available");
+      }
+
+      const recordType = publicDomainConfig.subdomain ? "CNAME" : "A";
+      const dnsTarget = recordType === "CNAME" ? result.defaultFqdn ?? result.fqdn : environmentInfo.staticIp;
+      if (!dnsTarget) {
+        throw new Error(`Unable to resolve DNS target for ${publicHostname}`);
+      }
+
+      const hostRecordName = publicDomainConfig.subdomain ?? "@";
+      const verificationRecordName = publicDomainConfig.subdomain ? `asuid.${publicDomainConfig.subdomain}` : "asuid";
+
+      emitDeployLog("info", "Publishing public domain DNS records", {
+        containerAppName,
+        publicHostname,
+        hostRecordName,
+        verificationRecordName,
+        recordType,
+        dnsTarget,
+      });
+      await persistProgress({
+        percent: 96,
+        step: "dns-host",
+        message: "Creando registro DNS del dominio",
+        status: "provisioning",
+        meta: {
+          containerAppName,
+          publicHostname,
+          hostRecordName,
+          verificationRecordName,
+          recordType,
+          dnsTarget,
+        },
+      });
+      await createDnsRecord({
+        domain: publicDomainConfig.domain,
+        subdomain: hostRecordName,
+        type: recordType,
+        value: dnsTarget,
+        ttl: publicDomainConfig.ttl,
+      });
+
+      await persistProgress({
+        percent: 97,
+        step: "dns-verification",
+        message: "Creando TXT de verificación",
+        status: "provisioning",
+        meta: {
+          containerAppName,
+          publicHostname,
+          verificationRecordName,
+          verificationId,
+        },
+      });
+      await createDnsRecord({
+        domain: publicDomainConfig.domain,
+        subdomain: verificationRecordName,
+        type: "TXT",
+        value: verificationId,
+        ttl: publicDomainConfig.ttl,
+      });
+
+      await persistProgress({
+        percent: 98,
+        step: "dns-propagation",
+        message: "Esperando propagación DNS antes del certificado",
+        status: "provisioning",
+        meta: {
+          containerAppName,
+          publicHostname,
+          verificationRecordName,
+          dnsTarget,
+        },
+      });
+      await new Promise((resolve) => setTimeout(resolve, 10_000));
+
+      emitDeployLog("info", "Registering custom hostname before certificate", {
+        containerAppName,
+        publicHostname,
+      });
+      await persistProgress({
+        percent: 98,
+        step: "hostname",
+        message: "Registrando hostname personalizado",
+        status: "provisioning",
+        meta: {
+          containerAppName,
+          publicHostname,
+        },
+      });
+      result = await upsertContainerApp({
+        containerAppName,
+        external: true,
+        targetPort: runtime.port,
+        image: runtime.image,
+        startupScript: runtime.startupScript,
+        cpu,
+        memory,
+        minReplicas,
+        maxReplicas,
+        volumes,
+        volumeMounts,
+        healthPath: runtime.healthPath,
+        startupInitialDelaySeconds: runtime.startupInitialDelaySeconds,
+        startupFailureThreshold: runtime.startupFailureThreshold,
+        startupPeriodSeconds: runtime.startupPeriodSeconds,
+        env: baseEnv,
+        secrets,
+        customDomains: publicDomainInitialBinding,
+        log: emitDeployLog,
+      });
+
+      const validationMethod = recordType === "CNAME" ? "CNAME" : "HTTP";
+      const certificateName = buildPublicDomainCertificateName(publicHostname);
+      emitDeployLog("info", "Creating managed certificate", {
+        containerAppName,
+        publicHostname,
+        certificateName,
+        validationMethod,
+      });
+      await persistProgress({
+        percent: 99,
+        step: "certificate",
+        message: "Generando certificado administrado",
+        status: "provisioning",
+        meta: {
+          containerAppName,
+          publicHostname,
+          certificateName,
+          validationMethod,
+        },
+      });
+      try {
+        const certificate = await createManagedCertificate({
+          hostname: publicHostname,
+          validationMethod,
+          certificateName,
+          waitForCompletionMs: 180_000,
+          allowPending: true,
+        });
+        certificateState = certificate.provisioningState;
+
+        if (certificate.pending) {
+          certificatePending = true;
+          emitDeployLog("warn", "Managed certificate still provisioning; will bind automatically later", {
+            containerAppName,
+            publicHostname,
+            certificateName,
+            certificateState: certificate.provisioningState,
+          });
+          await persistProgress({
+            percent: 99,
+            step: "certificate-pending",
+            message: "Certificado pendiente de aprovisionamiento; se enlazara automaticamente cuando Azure lo termine",
+            status: "provisioning",
+            meta: {
+              containerAppName,
+              publicHostname,
+              certificateId: certificate.id,
+              certificateState: certificate.provisioningState,
+            },
+          });
+        } else {
+          certificatePending = false;
+          await persistProgress({
+            percent: 99,
+            step: "binding",
+            message: "Asociando dominio al contenedor",
+            status: "provisioning",
+            meta: {
+              containerAppName,
+              publicHostname,
+              certificateId: certificate.id,
+            },
+          });
+          result = await upsertContainerApp({
+            containerAppName,
+            external: true,
+            targetPort: runtime.port,
+            image: runtime.image,
+            startupScript: runtime.startupScript,
+            cpu,
+            memory,
+            minReplicas,
+            maxReplicas,
+            volumes,
+            volumeMounts,
+            healthPath: runtime.healthPath,
+            startupInitialDelaySeconds: runtime.startupInitialDelaySeconds,
+            startupFailureThreshold: runtime.startupFailureThreshold,
+            startupPeriodSeconds: runtime.startupPeriodSeconds,
+            env: baseEnv,
+            secrets,
+            customDomains: [
+              {
+                name: publicHostname,
+                bindingType: "SniEnabled",
+                certificateId: certificate.id,
+              },
+            ],
+            log: emitDeployLog,
+          });
+          await persistProgress({
+            percent: 99,
+            step: "domain-ready",
+            message: "Dominio personalizado listo",
+            status: "provisioning",
+            meta: {
+              containerAppName,
+              publicHostname,
+              fqdn: result.fqdn,
+              defaultFqdn: result.defaultFqdn,
+              customDomains: result.customDomains,
+            },
+          });
+        }
+      } catch (error) {
+        if (!isRetryableCustomHostnameValidationError(error)) {
+          throw error;
+        }
+
+        certificatePending = true;
+        certificateState = "Pending";
+        emitDeployLog("warn", "Managed certificate validation still not visible; will continue provisioning and retry later", {
+          containerAppName,
+          publicHostname,
+          certificateName,
+          error: error instanceof Error ? error.message : String(error),
+        });
+        await persistProgress({
+          percent: 99,
+          step: "certificate-pending",
+          message: "Validación del certificado aún no está visible; se reintentará automáticamente",
+          status: "provisioning",
+          meta: {
+            containerAppName,
+            publicHostname,
+            certificateName,
+            error: error instanceof Error ? error.message : String(error),
+          },
+        });
+      }
+    }
+
+    const hasCustomHostname = Boolean(publicDomainConfig && publicHostname);
+    const deploymentReady = !hasCustomHostname || !result.customDomains.length || result.fqdn === publicHostname;
+    const finalFqdn = result.fqdn ?? result.defaultFqdn;
+    if (deploymentReady) {
+      await s`UPDATE deployments SET status = 'live', fqdn = ${finalFqdn} WHERE id = ${deploymentId}`;
+      await s`UPDATE projects SET container_app_name = ${containerAppName}, fqdn = ${finalFqdn}, last_deployed_at = now() WHERE id = ${proj.id}`;
+      await s`UPDATE functions SET status = 'live', container_app_name = ${containerAppName}, fqdn = ${finalFqdn}, updated_at = now() WHERE project_id = ${proj.id}`;
+      await persistProgress({
+        percent: 100,
+        step: "live",
+        message: `Deploy v${version} OK`,
+        status: "live",
+        meta: {
+          fqdn: finalFqdn,
+          defaultFqdn: result.defaultFqdn,
+          customDomains: result.customDomains,
+          runtime: runtimeId,
+          version,
+        },
+      });
+    } else {
+      await s`UPDATE deployments SET status = 'provisioning', fqdn = ${finalFqdn} WHERE id = ${deploymentId}`;
+      await s`UPDATE projects SET container_app_name = ${containerAppName}, fqdn = ${finalFqdn}, last_deployed_at = now() WHERE id = ${proj.id}`;
+      await s`UPDATE functions SET status = 'provisioning', container_app_name = ${containerAppName}, fqdn = ${finalFqdn}, updated_at = now() WHERE project_id = ${proj.id}`;
+    }
+
+    const usingCustom = result.customDomains.length > 0 && finalFqdn === publicHostname;
     await logEvent(
       proj.id,
       ownerId,
       "info",
       "deploy",
-      `Deploy v${version} OK (${runtimeId})`,
+      deploymentReady ? `Deploy v${version} OK (${runtimeId})` : `Deploy v${version} OK, certificate pending (${runtimeId})`,
       {
-        fqdn: result.fqdn,
+        fqdn: finalFqdn,
         defaultFqdn: result.defaultFqdn,
         customDomains: result.customDomains,
         usingCustomDomain: usingCustom,
         runtime: runtimeId,
+        publicHostname,
+        certificatePending,
       },
     );
-    progress?.("info", `Deploy v${version} OK`, {
-      fqdn: result.fqdn,
+    progress?.(deploymentReady ? "info" : "warn", deploymentReady ? `Deploy v${version} OK` : `Deploy v${version} OK, certificado pendiente`, {
+      fqdn: finalFqdn,
       defaultFqdn: result.defaultFqdn,
       customDomains: result.customDomains,
       runtime: runtimeId,
       version,
+      publicHostname,
+      certificatePending,
     });
     return {
       ok: true,
       deploymentId,
-      fqdn: result.fqdn,
+      fqdn: finalFqdn,
       defaultFqdn: result.defaultFqdn,
       customDomains: result.customDomains,
       version,
       runtime: runtimeId,
+      publicHostname,
+      publicHostnameStatus: hasCustomHostname ? (deploymentReady ? "ready" : "pending") : "none",
+      certificateState: hasCustomHostname ? (deploymentReady ? "Succeeded" : certificateState) : null,
     };
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
@@ -455,6 +1380,18 @@ export async function deployProjectById({
     await logEvent(proj.id, ownerId, "error", "deploy", `Deploy v${version} FAILED`, {
       error: msg,
       runtime: runtimeId,
+    });
+    await persistProgress({
+      percent: 100,
+      step: "failed",
+      message: `Deploy v${version} FAILED`,
+      level: "error",
+      status: "failed",
+      meta: {
+        error: msg,
+        runtime: runtimeId,
+        version,
+      },
     });
     progress?.("error", `Deploy v${version} FAILED`, {
       error: msg,
