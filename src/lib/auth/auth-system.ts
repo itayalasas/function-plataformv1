@@ -4,6 +4,7 @@
 const ENV_ENDPOINT = "https://apis-pets-app.proudmoss-ff0cfe85.northcentralus.azurecontainerapps.io/api/get-env";
 const ENV_ACCESS_KEY = "d61ec0701398f9f7c148c39f3f8c2ac21aabb83dfa8362c7b69e411191d37227";
 
+
 const STORAGE_KEYS = {
   config: "authsystem:config",
   access: "authsystem:access_token",
