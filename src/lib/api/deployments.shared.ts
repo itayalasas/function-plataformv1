@@ -1174,12 +1174,33 @@ export async function deployProjectById({
           dnsTarget,
         },
       });
-      await waitForDnsTxtRecord({
-        fqdn: `${verificationRecordName}.${publicDomainConfig.domain}`,
-        expectedValue: verificationId,
-        timeoutMs: 180_000,
-        intervalMs: 5_000,
-      });
+      try {
+        await waitForDnsTxtRecord({
+          fqdn: `${verificationRecordName}.${publicDomainConfig.domain}`,
+          expectedValue: verificationId,
+          timeoutMs: 30_000,
+          intervalMs: 5_000,
+        });
+      } catch (error) {
+        emitDeployLog("warn", "DNS TXT propagation is still in progress; continuing with pending certificate flow", {
+          containerAppName,
+          publicHostname,
+          verificationRecordName,
+          error: error instanceof Error ? error.message : String(error),
+        });
+        await persistProgress({
+          percent: 98,
+          step: "dns-propagation-timeout",
+          message: "La propagación DNS aún sigue en curso; continuaremos en modo pendiente",
+          status: "provisioning",
+          meta: {
+            containerAppName,
+            publicHostname,
+            verificationRecordName,
+            error: error instanceof Error ? error.message : String(error),
+          },
+        });
+      }
 
       emitDeployLog("info", "Registering custom hostname before certificate", {
         containerAppName,
@@ -1263,13 +1284,13 @@ export async function deployProjectById({
           },
         });
         try {
-          const certificate = await createManagedCertificate({
-            hostname: publicHostname,
-            validationMethod,
-            certificateName,
-            waitForCompletionMs: 180_000,
-            allowPending: true,
-          });
+        const certificate = await createManagedCertificate({
+          hostname: publicHostname,
+          validationMethod,
+          certificateName,
+          waitForCompletionMs: 0,
+          allowPending: true,
+        });
           certificateState = certificate.provisioningState;
 
           if (certificate.pending) {
