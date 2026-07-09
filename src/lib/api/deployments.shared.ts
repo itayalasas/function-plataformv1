@@ -1,4 +1,5 @@
 import { sql, ensureSchema, logEvent } from "../neon/db.server.ts";
+import { resolveTxt } from "node:dns/promises";
 import {
   createManagedCertificate,
   ensurePersistentStorageMount,
@@ -395,6 +396,39 @@ function resolveDnsApiBaseUrl(): string {
 function isRetryableCustomHostnameValidationError(error: unknown): boolean {
   const message = error instanceof Error ? error.message : String(error);
   return /InvalidCustomHostNameValidation|TXT record .* was not found|custom hostname validation/i.test(message);
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function waitForDnsTxtRecord(input: {
+  fqdn: string;
+  expectedValue: string;
+  timeoutMs?: number;
+  intervalMs?: number;
+}): Promise<void> {
+  const timeoutMs = input.timeoutMs ?? 180_000;
+  const intervalMs = input.intervalMs ?? 5_000;
+  const deadline = Date.now() + timeoutMs;
+  let lastSeen = "";
+
+  while (Date.now() < deadline) {
+    try {
+      const records = await resolveTxt(input.fqdn);
+      const flattened = records.map((set) => set.join("")).filter(Boolean);
+      lastSeen = flattened.join(" | ");
+      if (flattened.some((value) => value.trim() === input.expectedValue.trim())) {
+        return;
+      }
+    } catch (error) {
+      lastSeen = error instanceof Error ? error.message : String(error);
+    }
+
+    await sleep(intervalMs);
+  }
+
+  throw new Error(`DNS TXT record ${input.fqdn} was not visible after waiting (${lastSeen || "no response"})`);
 }
 
 async function createDnsRecord(input: {
@@ -1140,7 +1174,12 @@ export async function deployProjectById({
           dnsTarget,
         },
       });
-      await new Promise((resolve) => setTimeout(resolve, 10_000));
+      await waitForDnsTxtRecord({
+        fqdn: `${verificationRecordName}.${publicDomainConfig.domain}`,
+        expectedValue: verificationId,
+        timeoutMs: 180_000,
+        intervalMs: 5_000,
+      });
 
       emitDeployLog("info", "Registering custom hostname before certificate", {
         containerAppName,
@@ -1156,162 +1195,191 @@ export async function deployProjectById({
           publicHostname,
         },
       });
-      result = await upsertContainerApp({
-        containerAppName,
-        external: true,
-        targetPort: runtime.port,
-        image: runtime.image,
-        startupScript: runtime.startupScript,
-        cpu,
-        memory,
-        minReplicas,
-        maxReplicas,
-        volumes,
-        volumeMounts,
-        healthPath: runtime.healthPath,
-        startupInitialDelaySeconds: runtime.startupInitialDelaySeconds,
-        startupFailureThreshold: runtime.startupFailureThreshold,
-        startupPeriodSeconds: runtime.startupPeriodSeconds,
-        env: baseEnv,
-        secrets,
-        customDomains: publicDomainInitialBinding,
-        log: emitDeployLog,
-      });
-
-      const validationMethod = recordType === "CNAME" ? "CNAME" : "HTTP";
-      const certificateName = buildPublicDomainCertificateName(publicHostname);
-      emitDeployLog("info", "Creating managed certificate", {
-        containerAppName,
-        publicHostname,
-        certificateName,
-        validationMethod,
-      });
-      await persistProgress({
-        percent: 99,
-        step: "certificate",
-        message: "Generando certificado administrado",
-        status: "provisioning",
-        meta: {
-          containerAppName,
-          publicHostname,
-          certificateName,
-          validationMethod,
-        },
-      });
       try {
-        const certificate = await createManagedCertificate({
-          hostname: publicHostname,
-          validationMethod,
-          certificateName,
-          waitForCompletionMs: 180_000,
-          allowPending: true,
+        result = await upsertContainerApp({
+          containerAppName,
+          external: true,
+          targetPort: runtime.port,
+          image: runtime.image,
+          startupScript: runtime.startupScript,
+          cpu,
+          memory,
+          minReplicas,
+          maxReplicas,
+          volumes,
+          volumeMounts,
+          healthPath: runtime.healthPath,
+          startupInitialDelaySeconds: runtime.startupInitialDelaySeconds,
+          startupFailureThreshold: runtime.startupFailureThreshold,
+          startupPeriodSeconds: runtime.startupPeriodSeconds,
+          env: baseEnv,
+          secrets,
+          customDomains: publicDomainInitialBinding,
+          log: emitDeployLog,
         });
-        certificateState = certificate.provisioningState;
-
-        if (certificate.pending) {
-          certificatePending = true;
-          emitDeployLog("warn", "Managed certificate still provisioning; will bind automatically later", {
-            containerAppName,
-            publicHostname,
-            certificateName,
-            certificateState: certificate.provisioningState,
-          });
-          await persistProgress({
-            percent: 99,
-            step: "certificate-pending",
-            message: "Certificado pendiente de aprovisionamiento; se enlazara automaticamente cuando Azure lo termine",
-            status: "provisioning",
-            meta: {
-              containerAppName,
-              publicHostname,
-              certificateId: certificate.id,
-              certificateState: certificate.provisioningState,
-            },
-          });
-        } else {
-          certificatePending = false;
-          await persistProgress({
-            percent: 99,
-            step: "binding",
-            message: "Asociando dominio al contenedor",
-            status: "provisioning",
-            meta: {
-              containerAppName,
-              publicHostname,
-              certificateId: certificate.id,
-            },
-          });
-          result = await upsertContainerApp({
-            containerAppName,
-            external: true,
-            targetPort: runtime.port,
-            image: runtime.image,
-            startupScript: runtime.startupScript,
-            cpu,
-            memory,
-            minReplicas,
-            maxReplicas,
-            volumes,
-            volumeMounts,
-            healthPath: runtime.healthPath,
-            startupInitialDelaySeconds: runtime.startupInitialDelaySeconds,
-            startupFailureThreshold: runtime.startupFailureThreshold,
-            startupPeriodSeconds: runtime.startupPeriodSeconds,
-            env: baseEnv,
-            secrets,
-            customDomains: [
-              {
-                name: publicHostname,
-                bindingType: "SniEnabled",
-                certificateId: certificate.id,
-              },
-            ],
-            log: emitDeployLog,
-          });
-          await persistProgress({
-            percent: 99,
-            step: "domain-ready",
-            message: "Dominio personalizado listo",
-            status: "provisioning",
-            meta: {
-              containerAppName,
-              publicHostname,
-              fqdn: result.fqdn,
-              defaultFqdn: result.defaultFqdn,
-              customDomains: result.customDomains,
-            },
-          });
-        }
       } catch (error) {
         if (!isRetryableCustomHostnameValidationError(error)) {
           throw error;
         }
-
         certificatePending = true;
         certificateState = "Pending";
-        emitDeployLog("warn", "Managed certificate validation still not visible; will continue provisioning and retry later", {
+        emitDeployLog("warn", "Hostname registration still propagating; will keep deployment pending", {
           containerAppName,
           publicHostname,
-          certificateName,
           error: error instanceof Error ? error.message : String(error),
         });
         await persistProgress({
+          percent: 98,
+          step: "hostname-pending",
+          message: "El hostname personalizado todavía está propagando; se reintentará automáticamente",
+          status: "provisioning",
+          meta: {
+            containerAppName,
+            publicHostname,
+            error: error instanceof Error ? error.message : String(error),
+          },
+        });
+      }
+
+      if (!certificatePending) {
+        const validationMethod = recordType === "CNAME" ? "CNAME" : "HTTP";
+        const certificateName = buildPublicDomainCertificateName(publicHostname);
+        emitDeployLog("info", "Creating managed certificate", {
+          containerAppName,
+          publicHostname,
+          certificateName,
+          validationMethod,
+        });
+        await persistProgress({
           percent: 99,
-          step: "certificate-pending",
-          message: "Validación del certificado aún no está visible; se reintentará automáticamente",
+          step: "certificate",
+          message: "Generando certificado administrado",
           status: "provisioning",
           meta: {
             containerAppName,
             publicHostname,
             certificateName,
-            error: error instanceof Error ? error.message : String(error),
+            validationMethod,
           },
         });
+        try {
+          const certificate = await createManagedCertificate({
+            hostname: publicHostname,
+            validationMethod,
+            certificateName,
+            waitForCompletionMs: 180_000,
+            allowPending: true,
+          });
+          certificateState = certificate.provisioningState;
+
+          if (certificate.pending) {
+            certificatePending = true;
+            emitDeployLog("warn", "Managed certificate still provisioning; will bind automatically later", {
+              containerAppName,
+              publicHostname,
+              certificateName,
+              certificateState: certificate.provisioningState,
+            });
+            await persistProgress({
+              percent: 99,
+              step: "certificate-pending",
+              message: "Certificado pendiente de aprovisionamiento; se enlazara automaticamente cuando Azure lo termine",
+              status: "provisioning",
+              meta: {
+                containerAppName,
+                publicHostname,
+                certificateId: certificate.id,
+                certificateState: certificate.provisioningState,
+              },
+            });
+          } else {
+            certificatePending = false;
+            await persistProgress({
+              percent: 99,
+              step: "binding",
+              message: "Asociando dominio al contenedor",
+              status: "provisioning",
+              meta: {
+                containerAppName,
+                publicHostname,
+                certificateId: certificate.id,
+              },
+            });
+            result = await upsertContainerApp({
+              containerAppName,
+              external: true,
+              targetPort: runtime.port,
+              image: runtime.image,
+              startupScript: runtime.startupScript,
+              cpu,
+              memory,
+              minReplicas,
+              maxReplicas,
+              volumes,
+              volumeMounts,
+              healthPath: runtime.healthPath,
+              startupInitialDelaySeconds: runtime.startupInitialDelaySeconds,
+              startupFailureThreshold: runtime.startupFailureThreshold,
+              startupPeriodSeconds: runtime.startupPeriodSeconds,
+              env: baseEnv,
+              secrets,
+              customDomains: [
+                {
+                  name: publicHostname,
+                  bindingType: "SniEnabled",
+                  certificateId: certificate.id,
+                },
+              ],
+              log: emitDeployLog,
+            });
+            await persistProgress({
+              percent: 99,
+              step: "domain-ready",
+              message: "Dominio personalizado listo",
+              status: "provisioning",
+              meta: {
+                containerAppName,
+                publicHostname,
+                fqdn: result.fqdn,
+                defaultFqdn: result.defaultFqdn,
+                customDomains: result.customDomains,
+              },
+            });
+          }
+        } catch (error) {
+          if (!isRetryableCustomHostnameValidationError(error)) {
+            throw error;
+          }
+
+          certificatePending = true;
+          certificateState = "Pending";
+          emitDeployLog("warn", "Managed certificate validation still not visible; will continue provisioning and retry later", {
+            containerAppName,
+            publicHostname,
+            error: error instanceof Error ? error.message : String(error),
+          });
+          await persistProgress({
+            percent: 99,
+            step: "certificate-pending",
+            message: "Validación del certificado aún no está visible; se reintentará automáticamente",
+            status: "provisioning",
+            meta: {
+              containerAppName,
+              publicHostname,
+              error: error instanceof Error ? error.message : String(error),
+            },
+          });
+        }
       }
     }
 
     const hasCustomHostname = Boolean(publicDomainConfig && publicHostname);
-    const deploymentReady = !hasCustomHostname || !result.customDomains.length || result.fqdn === publicHostname;
+    const customDomainReady = Boolean(
+      hasCustomHostname &&
+        result.fqdn === publicHostname &&
+        result.customDomains.some((domain) => normalizeHostnameLabel(domain) === publicHostname),
+    );
+    const deploymentReady = !hasCustomHostname || customDomainReady;
     const finalFqdn = result.fqdn ?? result.defaultFqdn;
     if (deploymentReady) {
       await s`UPDATE deployments SET status = 'live', fqdn = ${finalFqdn} WHERE id = ${deploymentId}`;
