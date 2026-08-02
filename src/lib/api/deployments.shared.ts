@@ -486,7 +486,12 @@ function normalizeBaseUrl(input: string | null | undefined): string | null {
     ) {
       return null;
     }
-    return parsed.origin;
+    // Azure Container Apps terminates TLS at the ingress and forwards plain HTTP
+    // internally, so `request.url` can come back as http:// even though the
+    // platform is only ever reachable externally over https. Runner containers
+    // call this URL from outside that internal network, so http:// would 301
+    // redirect and silently drop the POST body — force https unconditionally.
+    return `https://${parsed.host}`;
   } catch {
     return null;
   }
