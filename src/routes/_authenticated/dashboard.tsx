@@ -34,6 +34,7 @@ import {
   startProjectContainerApp,
   stopProjectContainerApp,
   restartProjectContainerApp,
+  updateProjectPublicDomain,
 } from "@/lib/api/projects.functions";
 import { listFunctions, createFunction, deleteFunction } from "@/lib/api/functions.functions";
 import { listFiles, upsertFile, createDirectory, deleteFile, renameFile } from "@/lib/api/files.functions";
@@ -401,6 +402,8 @@ function ProjectView({
   const startProjectApp = useServerFn(startProjectContainerApp);
   const stopProjectApp = useServerFn(stopProjectContainerApp);
   const restartProjectApp = useServerFn(restartProjectContainerApp);
+  const deployProjectFn = useServerFn(deployProject);
+  const updatePublicDomain = useServerFn(updateProjectPublicDomain);
 
   const fns = useQuery({ queryKey: ["fns", projectId], queryFn: () => lf({ data: { projectId } }) });
   const projectAppStatus = useQuery({
@@ -472,6 +475,48 @@ function ProjectView({
       refreshProjectAppState();
     },
     onError: (e) => toast.error(e instanceof Error ? e.message : "Error"),
+  });
+
+  const redeployProjectMut = useMutation({
+    mutationFn: () => deployProjectFn({ data: { projectId } }),
+    onSuccess: (r: any) => {
+      toast.success(`Proyecto redesplegado v${r.version}`);
+      refreshProjectAppState();
+      qc.invalidateQueries({ queryKey: ["deps", projectId] });
+    },
+    onError: (e) => toast.error(e instanceof Error ? e.message : "Error al redesplegar el proyecto"),
+  });
+
+  const [domainDialogOpen, setDomainDialogOpen] = useState(false);
+  const [domainInput, setDomainInput] = useState("");
+  const [subdomainInput, setSubdomainInput] = useState("");
+  const currentPublicDomainConfig = projectAppStatus.data?.publicDomainConfig ?? null;
+
+  const openDomainDialog = () => {
+    setDomainInput(currentPublicDomainConfig?.domain ?? "");
+    setSubdomainInput(currentPublicDomainConfig?.subdomain ?? "");
+    setDomainDialogOpen(true);
+  };
+
+  const saveDomainMut = useMutation({
+    mutationFn: () =>
+      updatePublicDomain({
+        data: {
+          projectId,
+          domain: domainInput.trim() ? domainInput.trim() : null,
+          subdomain: subdomainInput.trim() ? subdomainInput.trim() : null,
+        },
+      }),
+    onSuccess: () => {
+      toast.success(
+        domainInput.trim()
+          ? "Dominio guardado. Hacé Redeploy proyecto para aplicar el binding en Azure."
+          : "Dominio removido. Hacé Redeploy proyecto para aplicar el cambio.",
+      );
+      setDomainDialogOpen(false);
+      refreshProjectAppState();
+    },
+    onError: (e) => toast.error(e instanceof Error ? e.message : "Error al guardar el dominio"),
   });
 
   const appIsBusy =
@@ -623,6 +668,12 @@ function ProjectView({
               dominio pendiente
             </Badge>
           )}
+          {projectAppStatus.data?.publicHostnameStatus === "ready" && projectAppStatus.data.publicHostname && (
+            <Badge className="gap-1 border border-emerald-500/30 bg-emerald-500/10 text-emerald-500 font-mono">
+              <Globe className="h-3 w-3" />
+              {projectAppStatus.data.publicHostname}
+            </Badge>
+          )}
           <span className="text-xs text-muted-foreground">
             {projectAppStatus.data?.containerAppName
               ? projectAppStatus.data.containerAppName
@@ -676,6 +727,85 @@ function ProjectView({
             )}
             Reiniciar
           </Button>
+          <Button
+            size="sm"
+            variant="outline"
+            className="gap-1"
+            onClick={() => redeployProjectMut.mutate()}
+            disabled={!fns.data?.length || redeployProjectMut.isPending}
+            title="Vuelve a desplegar el proyecto completo: recalcula el runner y las variables de entorno para todas las funciones"
+          >
+            {redeployProjectMut.isPending ? (
+              <Loader2 className="h-3.5 w-3.5 animate-spin" />
+            ) : (
+              <Rocket className="h-3.5 w-3.5" />
+            )}
+            Redeploy proyecto
+          </Button>
+          <Dialog open={domainDialogOpen} onOpenChange={setDomainDialogOpen}>
+            <Button
+              size="sm"
+              variant="outline"
+              className="gap-1"
+              onClick={openDomainDialog}
+              disabled={!appHasContainer}
+              title={!appHasContainer ? "Primero debes desplegar el proyecto" : "Configurar dominio público"}
+            >
+              <Globe className="h-3.5 w-3.5" />
+              Dominio
+            </Button>
+            <DialogContent>
+              <DialogHeader>
+                <DialogTitle>Dominio público del proyecto</DialogTitle>
+              </DialogHeader>
+              <div className="space-y-3">
+                <p className="text-xs text-muted-foreground">
+                  Enlaza un dominio propio a este proyecto en vez de la URL por defecto de Azure
+                  ({projectAppStatus.data?.defaultFqdn ?? "…"}). Necesitás tener el DNS de ese dominio
+                  bajo tu control.
+                </p>
+                <div className="space-y-2">
+                  <Label>Dominio</Label>
+                  <Input
+                    value={domainInput}
+                    onChange={(e) => setDomainInput(e.target.value)}
+                    placeholder="midominio.com"
+                  />
+                </div>
+                <div className="space-y-2">
+                  <Label>Subdominio (opcional)</Label>
+                  <Input
+                    value={subdomainInput}
+                    onChange={(e) => setSubdomainInput(e.target.value)}
+                    placeholder="api"
+                  />
+                </div>
+                {domainInput.trim() && (
+                  <p className="text-xs text-muted-foreground font-mono">
+                    Resultado: {subdomainInput.trim() ? `${subdomainInput.trim()}.${domainInput.trim()}` : domainInput.trim()}
+                  </p>
+                )}
+              </div>
+              <DialogFooter className="gap-2">
+                {currentPublicDomainConfig && (
+                  <Button
+                    variant="ghost"
+                    className="text-destructive"
+                    disabled={saveDomainMut.isPending}
+                    onClick={() => { setDomainInput(""); setSubdomainInput(""); saveDomainMut.mutate(); }}
+                  >
+                    Quitar dominio
+                  </Button>
+                )}
+                <Button
+                  disabled={!domainInput.trim() || saveDomainMut.isPending}
+                  onClick={() => saveDomainMut.mutate()}
+                >
+                  {saveDomainMut.isPending ? <Loader2 className="w-4 h-4 animate-spin" /> : "Guardar"}
+                </Button>
+              </DialogFooter>
+            </DialogContent>
+          </Dialog>
         </div>
       </div>
 

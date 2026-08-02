@@ -4,7 +4,11 @@ import { requireAuthSystemAuth } from "@/lib/auth/server-middleware";
 import { sql, ensureSchema, slugify, logEvent } from "@/lib/neon/db.server";
 import { RUNTIMES, type RuntimeId } from "@/lib/runtimes";
 import { cloneProjectAndDeploy } from "@/lib/api/project-clone.shared";
-import { applyDefaultStorageMountPath, reconcilePublicDomainBinding } from "@/lib/api/deployments.shared";
+import {
+  applyDefaultStorageMountPath,
+  normalizeProjectDeploymentProfile,
+  reconcilePublicDomainBinding,
+} from "@/lib/api/deployments.shared";
 import {
   deleteContainerApp,
   getContainerApp,
@@ -20,7 +24,7 @@ async function getProjectContainerApp(projectId: string, ownerId: string) {
   await ensureSchema();
   const s = sql();
   const rows = (await s`
-    SELECT id, name, slug, container_app_name, fqdn, runtime
+    SELECT id, name, slug, container_app_name, fqdn, runtime, deployment_profile
     FROM projects
     WHERE id = ${projectId} AND owner_id = ${ownerId}
     LIMIT 1
@@ -31,6 +35,7 @@ async function getProjectContainerApp(projectId: string, ownerId: string) {
     container_app_name: string | null;
     fqdn: string | null;
     runtime: string | null;
+    deployment_profile: unknown;
   }>;
   return rows[0] ?? null;
 }
@@ -192,6 +197,67 @@ export const updateProjectRuntime = createServerFn({ method: "POST" })
     return { ok: true };
   });
 
+const publicDomainSchema = z
+  .object({
+    projectId: z.string().uuid(),
+    domain: z
+      .string()
+      .trim()
+      .min(1)
+      .max(253)
+      .regex(/^(?=.{1,253}$)(?!-)(?:[a-z0-9-]{1,63}\.)+[a-z]{2,63}$/i, "Usa un dominio válido, ej: midominio.com")
+      .nullable(),
+    subdomain: z
+      .string()
+      .trim()
+      .min(1)
+      .max(63)
+      .regex(/^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/i, "Usa un subdominio válido, ej: api")
+      .nullable()
+      .optional(),
+  })
+  .superRefine((value, ctx) => {
+    if (value.subdomain && !value.domain) {
+      ctx.addIssue({
+        code: "custom",
+        path: ["domain"],
+        message: "El dominio es requerido si defines un subdominio",
+      });
+    }
+  });
+
+export const updateProjectPublicDomain = createServerFn({ method: "POST" })
+  .middleware([requireAuthSystemAuth])
+  .inputValidator((d) => publicDomainSchema.parse(d))
+  .handler(async ({ data, context }) => {
+    await ensureSchema();
+    const s = sql();
+    const rows = (await s`
+      SELECT deployment_profile FROM projects WHERE id = ${data.projectId} AND owner_id = ${context.userId}
+    `) as Array<{ deployment_profile: unknown }>;
+    if (!rows[0]) throw new Error("Project not found");
+
+    const profile = normalizeProjectDeploymentProfile(rows[0].deployment_profile);
+    profile.publicDomain = data.domain
+      ? {
+          domain: data.domain.toLowerCase(),
+          subdomain: data.subdomain ? data.subdomain.toLowerCase() : null,
+          ttl: 600,
+        }
+      : null;
+
+    await s`
+      UPDATE projects SET deployment_profile = ${JSON.stringify(profile)}::jsonb
+      WHERE id = ${data.projectId} AND owner_id = ${context.userId}
+    `;
+
+    await logEvent(data.projectId, context.userId, "info", "domain", "Public domain configuration updated", {
+      publicDomain: profile.publicDomain,
+    });
+
+    return { ok: true, publicDomain: profile.publicDomain ?? null };
+  });
+
 export const deleteProject = createServerFn({ method: "POST" })
   .middleware([requireAuthSystemAuth])
   .inputValidator((d) => z.object({ id: z.string().uuid() }).parse(d))
@@ -230,6 +296,7 @@ export const getProjectContainerAppStatus = createServerFn({ method: "GET" })
   .handler(async ({ data, context }) => {
     const project = await getProjectContainerApp(data.projectId, context.userId);
     if (!project) throw new Error("Project not found");
+    const publicDomainConfig = normalizeProjectDeploymentProfile(project.deployment_profile).publicDomain ?? null;
     if (!project.container_app_name) {
       return {
         projectId: project.id,
@@ -243,6 +310,7 @@ export const getProjectContainerAppStatus = createServerFn({ method: "GET" })
         publicHostnameStatus: "none",
         certificateState: null,
         publicHostname: null,
+        publicDomainConfig,
       };
     }
 
@@ -264,6 +332,7 @@ export const getProjectContainerAppStatus = createServerFn({ method: "GET" })
         publicHostnameStatus: publicDomain?.status ?? "none",
         certificateState: publicDomain?.certificateState ?? null,
         publicHostname: publicDomain?.publicHostname ?? null,
+        publicDomainConfig,
       };
     }
 
@@ -279,6 +348,7 @@ export const getProjectContainerAppStatus = createServerFn({ method: "GET" })
       publicHostnameStatus: publicDomain?.status ?? "none",
       certificateState: publicDomain?.certificateState ?? null,
       publicHostname: publicDomain?.publicHostname ?? null,
+      publicDomainConfig,
     };
   });
 

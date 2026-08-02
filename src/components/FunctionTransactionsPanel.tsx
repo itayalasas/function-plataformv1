@@ -45,12 +45,48 @@ function normalizeJson(value: unknown): unknown {
   }
 }
 
+function looksLikeJson(text: string): boolean {
+  const trimmed = text.trim();
+  if (trimmed.length < 2) return false;
+  const first = trimmed[0];
+  const last = trimmed[trimmed.length - 1];
+  return (first === "{" && last === "}") || (first === "[" && last === "]");
+}
+
+// Fields like `request.body` / `response.body` are stored as raw JSON text
+// (whatever the wire payload was), so a plain JSON.stringify of the parent
+// object renders them as one escaped-quote blob. Recursively re-parse any
+// string that looks like JSON so nested payloads get the same indentation
+// as the rest of the log entry.
+function deepParseJsonStrings(value: unknown, depth = 0): unknown {
+  if (depth > 6) return value;
+  if (typeof value === "string") {
+    if (!looksLikeJson(value)) return value;
+    try {
+      return deepParseJsonStrings(JSON.parse(value), depth + 1);
+    } catch {
+      return value;
+    }
+  }
+  if (Array.isArray(value)) {
+    return value.map((item) => deepParseJsonStrings(item, depth + 1));
+  }
+  if (value && typeof value === "object") {
+    const out: Record<string, unknown> = {};
+    for (const [key, val] of Object.entries(value as Record<string, unknown>)) {
+      out[key] = deepParseJsonStrings(val, depth + 1);
+    }
+    return out;
+  }
+  return value;
+}
+
 function prettyJson(value: unknown): string {
   const normalized = normalizeJson(value);
   if (normalized == null) return "";
   if (typeof normalized === "string") return normalized;
   try {
-    return JSON.stringify(normalized, null, 2);
+    return JSON.stringify(deepParseJsonStrings(normalized), null, 2);
   } catch {
     return String(normalized);
   }
