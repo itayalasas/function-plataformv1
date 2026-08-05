@@ -28,6 +28,8 @@ bun install
 
 - `NEON_DATABASE_URL`
 - `VORTEX_CLONE_API_TOKEN` to call the project clone API
+- `VORTEX_CONNECTOR_API_TOKEN` for the connector API used by agents and external apps
+- `VORTEX_CONNECTOR_OWNER_ID` optional default owner for connector-token requests
 - `OPENAI_API_KEY`
 - `AZURE_TENANT_ID`
 - `AZURE_CLIENT_ID`
@@ -145,6 +147,60 @@ The installer creates `.vortex/cli`, installs the local CLI dependencies,
 adds `.vortex/` to `.gitignore`, writes a hidden `.vortex/.env` with the
 platform connection values, and injects an `npm run vortex` script when the
 project already has a `package.json`.
+
+## Connector API
+
+Use this API when another app or an agent needs to create projects and deploy
+the code it generated.
+
+Flow:
+
+1. `POST /api/connector/projects` to create the project.
+2. `POST /api/connector/projects/:projectId/functions/sync` to reconcile the
+   desired functions and files.
+3. `POST /api/connector/projects/:projectId/deploy` to deploy the project.
+
+Auth options:
+
+- `Authorization: Bearer <AuthSystem access token>`
+- `x-vortex-connector-token: <token>`
+- If you use the connector token, also send `x-vortex-owner-id: <owner_id>`
+  unless `VORTEX_CONNECTOR_OWNER_ID` is set.
+
+The `functions/sync` call is a full reconciliation. Send the complete desired
+function list and each function's full file tree.
+
+Example:
+
+```bash
+curl -X POST "$BASE_URL/api/connector/projects" \
+  -H "Content-Type: application/json" \
+  -H "x-vortex-connector-token: $VORTEX_CONNECTOR_API_TOKEN" \
+  -H "x-vortex-owner-id: $OWNER_ID" \
+  -d '{
+    "name": "Acme App",
+    "runtime": "deno",
+    "deploymentProfile": { "storageMountPath": "/data" }
+  }'
+```
+
+```bash
+curl -X POST "$BASE_URL/api/connector/projects/$PROJECT_ID/functions/sync" \
+  -H "Content-Type: application/json" \
+  -H "x-vortex-connector-token: $VORTEX_CONNECTOR_API_TOKEN" \
+  -H "x-vortex-owner-id: $OWNER_ID" \
+  -d '{
+    "functions": [
+      {
+        "name": "api",
+        "entrypoint": "index.ts",
+        "files": [
+          { "path": "index.ts", "content": "export default async function handler() { return new Response(\"ok\") }" }
+        ]
+      }
+    ]
+  }'
+```
 
 ## Azure deployment
 

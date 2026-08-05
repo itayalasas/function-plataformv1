@@ -28,3 +28,11 @@ export function getServerConfig() {
 export function getCloneApiToken(): string {
   return process.env.VORTEX_CLONE_API_TOKEN?.trim() ?? "";
 }
+
+export function getConnectorApiToken(): string {
+  return process.env.VORTEX_CONNECTOR_API_TOKEN?.trim() ?? "";
+}
+
+export function getConnectorOwnerId(): string {
+  return process.env.VORTEX_CONNECTOR_OWNER_ID?.trim() ?? "";
+}
