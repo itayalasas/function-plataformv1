@@ -125,6 +125,29 @@ export type ConnectorFunctionSyncResult = {
   filesDeleted: number;
 };
 
+export type ConnectorSecretInput = {
+  name: string;
+  value: string;
+};
+
+export type ConnectorSecretSyncInput = {
+  projectId: string;
+  ownerId: string;
+  secrets: ConnectorSecretInput[];
+};
+
+export type ConnectorSecretSyncResult = {
+  id: string;
+  name: string;
+  created: boolean;
+  updatedAt: string;
+};
+
+export type ConnectorSecretSyncSummary = {
+  secrets: ConnectorSecretSyncResult[];
+  deletedCount: number;
+};
+
 type ProjectRow = {
   id: string;
   slug: string;
@@ -145,6 +168,14 @@ type FunctionFileRow = {
   id: string;
   path: string;
 };
+
+type SecretRow = {
+  id: string;
+  name: string;
+  updated_at: string;
+};
+
+const secretNameRe = /^[A-Z_][A-Z0-9_]{0,60}$/;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
@@ -390,8 +421,7 @@ export async function syncConnectorProjectFunctions(
       `,
       [input.projectId, input.ownerId],
     );
-    const project = projectRows.rows[0];
-    if (!project) throw new Error("Project not found");
+    if (!projectRows.rows[0]) throw new Error("Project not found");
 
     const runtime = getRuntimeConfig((project.runtime ?? "deno") as RuntimeId);
     if (!runtime.multiFunction && input.functions.length > 1) {
@@ -504,6 +534,89 @@ export async function syncConnectorProjectFunctions(
     }
 
     return results;
+  });
+}
+
+export async function syncConnectorProjectSecrets(
+  input: ConnectorSecretSyncInput,
+): Promise<ConnectorSecretSyncSummary> {
+  await ensureSchema();
+
+  return withTransaction(async (client) => {
+    const projectRows = await client.query<ProjectRow>(
+      `
+        SELECT id, slug, runtime, deployment_profile
+        FROM projects
+        WHERE id = $1 AND owner_id = $2
+        LIMIT 1
+      `,
+      [input.projectId, input.ownerId],
+    );
+    const project = projectRows.rows[0];
+    if (!project) throw new Error("Project not found");
+
+    const existingRows = await client.query<SecretRow>(
+      `
+        SELECT id, name, updated_at
+        FROM secrets
+        WHERE project_id = $1 AND owner_id = $2
+        ORDER BY name ASC
+      `,
+      [input.projectId, input.ownerId],
+    );
+
+    const existingByName = new Map(existingRows.rows.map((row) => [row.name, row]));
+    const desiredNames = new Set<string>();
+    const normalizedSecrets = input.secrets.map((secret) => {
+      const name = secret.name.trim();
+      if (!name) {
+        throw new Error("Secret name is required");
+      }
+      if (!secretNameRe.test(name)) {
+        throw new Error(`Invalid secret name: ${name}`);
+      }
+      if (desiredNames.has(name)) {
+        throw new Error(`Duplicate secret name in payload: ${name}`);
+      }
+      desiredNames.add(name);
+      return { name, value: secret.value };
+    });
+
+    const secrets: ConnectorSecretSyncResult[] = [];
+    for (const secret of normalizedSecrets) {
+      const existing = existingByName.get(secret.name) ?? null;
+      const rows = await client.query<SecretRow>(
+        `
+          INSERT INTO secrets (project_id, owner_id, name, value)
+          VALUES ($1, $2, $3, $4)
+          ON CONFLICT (project_id, name)
+          DO UPDATE SET value = EXCLUDED.value, updated_at = now()
+          WHERE secrets.owner_id = $2
+          RETURNING id, name, updated_at
+        `,
+        [input.projectId, input.ownerId, secret.name, secret.value],
+      );
+      const row = rows.rows[0];
+      if (!row) throw new Error(`Failed to sync secret ${secret.name}`);
+      secrets.push({
+        id: row.id,
+        name: row.name,
+        created: !existing,
+        updatedAt: row.updated_at,
+      });
+    }
+
+    let deletedCount = 0;
+    for (const row of existingRows.rows) {
+      if (desiredNames.has(row.name)) continue;
+      await client.query(`DELETE FROM secrets WHERE id = $1 AND owner_id = $2`, [
+        row.id,
+        input.ownerId,
+      ]);
+      deletedCount += 1;
+    }
+
+    return { secrets, deletedCount };
   });
 }
 

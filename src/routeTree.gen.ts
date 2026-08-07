@@ -22,6 +22,7 @@ import { Route as ApiProjectsProjectIdExportRouteImport } from './routes/api/pro
 import { Route as ApiProjectsProjectIdCloneRouteImport } from './routes/api/projects/$projectId/clone'
 import { Route as ApiProjectsProjectIdDeploymentsDeploymentIdRouteImport } from './routes/api/projects/$projectId/deployments/$deploymentId'
 import { Route as ApiConnectorProjectsProjectIdDeployRouteImport } from './routes/api/connector/projects/$projectId/deploy'
+import { Route as ApiConnectorProjectsProjectIdSecretsSyncRouteImport } from './routes/api/connector/projects/$projectId/secrets/sync'
 import { Route as ApiConnectorProjectsProjectIdFunctionsSyncRouteImport } from './routes/api/connector/projects/$projectId/functions/sync'
 
 const LoginRoute = LoginRouteImport.update({
@@ -92,6 +93,12 @@ const ApiConnectorProjectsProjectIdDeployRoute =
     path: '/$projectId/deploy',
     getParentRoute: () => ApiConnectorProjectsRoute,
   } as any)
+const ApiConnectorProjectsProjectIdSecretsSyncRoute =
+  ApiConnectorProjectsProjectIdSecretsSyncRouteImport.update({
+    id: '/$projectId/secrets/sync',
+    path: '/$projectId/secrets/sync',
+    getParentRoute: () => ApiConnectorProjectsRoute,
+  } as any)
 const ApiConnectorProjectsProjectIdFunctionsSyncRoute =
   ApiConnectorProjectsProjectIdFunctionsSyncRouteImport.update({
     id: '/$projectId/functions/sync',
@@ -113,6 +120,7 @@ export interface FileRoutesByFullPath {
   '/api/connector/projects/$projectId/deploy': typeof ApiConnectorProjectsProjectIdDeployRoute
   '/api/projects/$projectId/deployments/$deploymentId': typeof ApiProjectsProjectIdDeploymentsDeploymentIdRoute
   '/api/connector/projects/$projectId/functions/sync': typeof ApiConnectorProjectsProjectIdFunctionsSyncRoute
+  '/api/connector/projects/$projectId/secrets/sync': typeof ApiConnectorProjectsProjectIdSecretsSyncRoute
 }
 export interface FileRoutesByTo {
   '/': typeof IndexRoute
@@ -128,6 +136,7 @@ export interface FileRoutesByTo {
   '/api/connector/projects/$projectId/deploy': typeof ApiConnectorProjectsProjectIdDeployRoute
   '/api/projects/$projectId/deployments/$deploymentId': typeof ApiProjectsProjectIdDeploymentsDeploymentIdRoute
   '/api/connector/projects/$projectId/functions/sync': typeof ApiConnectorProjectsProjectIdFunctionsSyncRoute
+  '/api/connector/projects/$projectId/secrets/sync': typeof ApiConnectorProjectsProjectIdSecretsSyncRoute
 }
 export interface FileRoutesById {
   __root__: typeof rootRouteImport
@@ -145,6 +154,7 @@ export interface FileRoutesById {
   '/api/connector/projects/$projectId/deploy': typeof ApiConnectorProjectsProjectIdDeployRoute
   '/api/projects/$projectId/deployments/$deploymentId': typeof ApiProjectsProjectIdDeploymentsDeploymentIdRoute
   '/api/connector/projects/$projectId/functions/sync': typeof ApiConnectorProjectsProjectIdFunctionsSyncRoute
+  '/api/connector/projects/$projectId/secrets/sync': typeof ApiConnectorProjectsProjectIdSecretsSyncRoute
 }
 export interface FileRouteTypes {
   fileRoutesByFullPath: FileRoutesByFullPath
@@ -162,6 +172,7 @@ export interface FileRouteTypes {
     | '/api/connector/projects/$projectId/deploy'
     | '/api/projects/$projectId/deployments/$deploymentId'
     | '/api/connector/projects/$projectId/functions/sync'
+    | '/api/connector/projects/$projectId/secrets/sync'
   fileRoutesByTo: FileRoutesByTo
   to:
     | '/'
@@ -177,6 +188,7 @@ export interface FileRouteTypes {
     | '/api/connector/projects/$projectId/deploy'
     | '/api/projects/$projectId/deployments/$deploymentId'
     | '/api/connector/projects/$projectId/functions/sync'
+    | '/api/connector/projects/$projectId/secrets/sync'
   id:
     | '__root__'
     | '/'
@@ -193,6 +205,7 @@ export interface FileRouteTypes {
     | '/api/connector/projects/$projectId/deploy'
     | '/api/projects/$projectId/deployments/$deploymentId'
     | '/api/connector/projects/$projectId/functions/sync'
+    | '/api/connector/projects/$projectId/secrets/sync'
   fileRoutesById: FileRoutesById
 }
 export interface RootRouteChildren {
@@ -301,6 +314,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof ApiConnectorProjectsProjectIdDeployRouteImport
       parentRoute: typeof ApiConnectorProjectsRoute
     }
+    '/api/connector/projects/$projectId/secrets/sync': {
+      id: '/api/connector/projects/$projectId/secrets/sync'
+      path: '/$projectId/secrets/sync'
+      fullPath: '/api/connector/projects/$projectId/secrets/sync'
+      preLoaderRoute: typeof ApiConnectorProjectsProjectIdSecretsSyncRouteImport
+      parentRoute: typeof ApiConnectorProjectsRoute
+    }
     '/api/connector/projects/$projectId/functions/sync': {
       id: '/api/connector/projects/$projectId/functions/sync'
       path: '/$projectId/functions/sync'
@@ -328,6 +348,7 @@ const AuthenticatedRouteWithChildren = AuthenticatedRoute._addFileChildren(
 interface ApiConnectorProjectsRouteChildren {
   ApiConnectorProjectsProjectIdDeployRoute: typeof ApiConnectorProjectsProjectIdDeployRoute
   ApiConnectorProjectsProjectIdFunctionsSyncRoute: typeof ApiConnectorProjectsProjectIdFunctionsSyncRoute
+  ApiConnectorProjectsProjectIdSecretsSyncRoute: typeof ApiConnectorProjectsProjectIdSecretsSyncRoute
 }
 
 const ApiConnectorProjectsRouteChildren: ApiConnectorProjectsRouteChildren = {
@@ -335,6 +356,8 @@ const ApiConnectorProjectsRouteChildren: ApiConnectorProjectsRouteChildren = {
     ApiConnectorProjectsProjectIdDeployRoute,
   ApiConnectorProjectsProjectIdFunctionsSyncRoute:
     ApiConnectorProjectsProjectIdFunctionsSyncRoute,
+  ApiConnectorProjectsProjectIdSecretsSyncRoute:
+    ApiConnectorProjectsProjectIdSecretsSyncRoute,
 }
 
 const ApiConnectorProjectsRouteWithChildren =

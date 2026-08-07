@@ -158,7 +158,9 @@ Flow:
 1. `POST /api/connector/projects` to create the project.
 2. `POST /api/connector/projects/:projectId/functions/sync` to reconcile the
    desired functions and files.
-3. `POST /api/connector/projects/:projectId/deploy` to deploy the project.
+3. `POST /api/connector/projects/:projectId/secrets/sync` to reconcile the
+   project secrets.
+4. `POST /api/connector/projects/:projectId/deploy` to deploy the project.
 
 Auth options:
 
@@ -169,6 +171,10 @@ Auth options:
 
 The `functions/sync` call is a full reconciliation. Send the complete desired
 function list and each function's full file tree.
+
+The `secrets/sync` call is also a full reconciliation. Send the complete
+desired secret list and the API will create or update those secrets, then
+delete any project secrets that are no longer present in the payload.
 
 Example:
 
@@ -198,6 +204,19 @@ curl -X POST "$BASE_URL/api/connector/projects/$PROJECT_ID/functions/sync" \
           { "path": "index.ts", "content": "export default async function handler() { return new Response(\"ok\") }" }
         ]
       }
+    ]
+  }'
+```
+
+```bash
+curl -X POST "$BASE_URL/api/connector/projects/$PROJECT_ID/secrets/sync" \
+  -H "Content-Type: application/json" \
+  -H "x-vortex-connector-token: $VORTEX_CONNECTOR_API_TOKEN" \
+  -H "x-vortex-owner-id: $OWNER_ID" \
+  -d '{
+    "secrets": [
+      { "name": "OPENAI_API_KEY", "value": "sk-..." },
+      { "name": "DATABASE_URL", "value": "postgres://user:pass@host:5432/db" }
     ]
   }'
 ```
